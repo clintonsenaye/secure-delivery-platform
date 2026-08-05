@@ -1,0 +1,33 @@
+# {{ ansible_managed }}
+# Managed by the cis_baseline Ansible role.
+
+# Minimum length. 14 is the CIS Level 1 figure.
+minlen = {{ cis_password_min_length }}
+
+# Character class requirements. A NEGATIVE value means "require at least this
+# many characters of that class". A positive value would instead grant length
+# credit for using the class, which is the opposite of what is wanted here, and
+# is an easy thing to get backwards.
+dcredit = {{ cis_password_dcredit }}
+ucredit = {{ cis_password_ucredit }}
+lcredit = {{ cis_password_lcredit }}
+ocredit = {{ cis_password_ocredit }}
+
+# Attempts allowed before the passwd command gives up.
+retry = {{ cis_password_retry }}
+
+# At least 4 characters must differ from the previous password, so people cannot
+# cycle password1, password2, password3.
+difok = 4
+
+# Rejects passwords containing the username or words from the GECOS field
+# (the user's real name), which are among the first things any cracker tries.
+usercheck = 1
+gecoscheck = 1
+
+# Checks against the cracklib dictionary.
+dictcheck = 1
+
+# Enforce the policy for root too. Without this, root can set a weak password
+# and the strongest account on the box becomes the weakest.
+enforce_for_root

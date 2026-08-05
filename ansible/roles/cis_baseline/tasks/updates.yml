@@ -1,0 +1,53 @@
+---
+# Unattended security upgrades.
+#
+# The single highest value control per line of configuration in this role. Most
+# hosts are compromised through a known vulnerability with an available patch,
+# not through anything novel. Automating the patch closes that window without
+# anyone having to remember.
+
+- name: Install unattended-upgrades and apt-listchanges
+  ansible.builtin.apt:
+    name:
+      - unattended-upgrades
+      - apt-listchanges
+    state: present
+
+# Turns on the two systemd timers that actually do the work. Installing the
+# package alone does not enable them on every image.
+- name: Enable the periodic apt timers
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure which updates are applied unattended
+  ansible.builtin.template:
+    src: 50unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart unattended-upgrades
+
+- name: Ensure the unattended-upgrades service is enabled
+  ansible.builtin.service:
+    name: unattended-upgrades
+    state: started
+    enabled: true
+
+# Validates the configuration by parsing it, rather than trusting that it is
+# correct and finding out weeks later that nothing has been patching.
+- name: Verify the unattended-upgrades configuration parses
+  ansible.builtin.command: unattended-upgrades --dry-run --debug
+  register: cis_unattended_check
+  changed_when: false
+  failed_when: cis_unattended_check.rc not in [0, 1]
+  check_mode: false
+
+- name: Report the unattended-upgrades dry run result
+  ansible.builtin.debug:
+    msg: "{{ cis_unattended_check.stdout_lines[-5:] | default(['no output']) }}"
+    verbosity: 1

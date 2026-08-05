@@ -1,0 +1,32 @@
+# {{ ansible_managed }}
+# Managed by the cis_baseline Ansible role.
+
+log_file = /var/log/audit/audit.log
+log_format = ENRICHED
+log_group = adm
+write_logs = yes
+
+# Rotation. max_log_file is in MB, so this keeps at most
+# {{ cis_auditd_max_log_file }} x {{ cis_auditd_num_logs }} = {{ cis_auditd_max_log_file * cis_auditd_num_logs }} MB of audit history.
+max_log_file = {{ cis_auditd_max_log_file }}
+num_logs = {{ cis_auditd_num_logs }}
+max_log_file_action = {{ cis_auditd_max_log_file_action }}
+
+# Disk space behaviour.
+#
+# Strict CIS says halt the system when audit logs cannot be written, on the
+# grounds that unaudited operation is worse than no operation. That turns a full
+# disk into an outage, so this baseline rotates and warns instead, and reserves
+# the disruptive action for the genuinely critical threshold. This is a
+# deliberate deviation and is documented in docs/architecture.md.
+space_left = 75
+space_left_action = {{ cis_auditd_space_left_action }}
+admin_space_left = 50
+admin_space_left_action = {{ cis_auditd_admin_space_left_action }}
+disk_full_action = {{ cis_auditd_disk_full_action }}
+disk_error_action = SYSLOG
+
+action_mail_acct = root
+flush = INCREMENTAL_ASYNC
+freq = 50
+name_format = HOSTNAME

@@ -1,0 +1,48 @@
+// {{ ansible_managed }}
+// Managed by the cis_baseline Ansible role.
+
+Unattended-Upgrade::Allowed-Origins {
+    // Security updates only by default. Automatically installing every update,
+    // including feature releases, is how a service breaks overnight with no one
+    // watching. Security patches are the ones worth taking that risk for.
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+{% if not cis_unattended_security_only %}
+    // Wider set, enabled because cis_unattended_security_only is false.
+    "${distro_id}:${distro_codename}-updates";
+{% endif %}
+};
+
+// Packages never upgraded automatically. Add anything where an unattended
+// restart would be disruptive, for example a database engine.
+Unattended-Upgrade::Package-Blacklist {
+};
+
+// Removes orphaned dependencies after an upgrade, so /boot and / do not slowly
+// fill with superseded kernels. A full /boot blocks all future kernel updates.
+Unattended-Upgrade::Remove-Unused-Dependencies "{{ 'true' if cis_unattended_remove_unused_dependencies else 'false' }}";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+
+// Keeps going if one package fails, rather than abandoning the whole run.
+Unattended-Upgrade::MinimalSteps "true";
+
+// Reboots.
+//
+// Off by default, deliberately. An unannounced 03:00 reboot is its own kind of
+// incident, and on a host running workloads it can be worse than the
+// vulnerability being patched. Enable it per host group where a reboot is
+// genuinely safe. /var/run/reboot-required still records that one is needed, so
+// monitoring can surface it either way.
+Unattended-Upgrade::Automatic-Reboot "{{ 'true' if cis_unattended_automatic_reboot else 'false' }}";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+Unattended-Upgrade::Automatic-Reboot-Time "{{ cis_unattended_automatic_reboot_time }}";
+
+// Log to syslog so upgrades appear alongside everything else, rather than only
+// in a file nobody reads.
+Unattended-Upgrade::SyslogEnable "true";
+Unattended-Upgrade::SyslogFacility "daemon";
+
+// Retry a package that failed to download, rather than skipping it silently for
+// a whole day until the next run.
+Acquire::Retries "3";

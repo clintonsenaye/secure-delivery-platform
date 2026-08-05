@@ -1,0 +1,34 @@
+---
+# Applies the CIS Level 1 baseline to every Ubuntu host in the [hardened] group.
+#
+# Dry run first, always:
+#   ansible-playbook site.yml --check --diff
+#
+# Then for real:
+#   ansible-playbook site.yml
+
+- name: Apply CIS Level 1 baseline to Ubuntu hosts
+  hosts: hardened
+  become: true
+
+  pre_tasks:
+    # Fails fast with a clear message rather than halfway through, if someone
+    # points this at a host family the role does not handle.
+    - name: Assert the target is a supported Ubuntu release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_major_version'] | int >= 22
+        fail_msg: >-
+          This role targets Ubuntu 22.04 or newer. Found
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+        success_msg: "Target is {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}."
+
+    - name: Refresh the apt cache if it is over an hour old
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      changed_when: false
+
+  roles:
+    - role: cis_baseline

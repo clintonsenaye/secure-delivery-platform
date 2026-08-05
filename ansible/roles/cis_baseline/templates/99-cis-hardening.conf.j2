@@ -1,0 +1,52 @@
+# {{ ansible_managed }}
+# CIS Level 1 SSH baseline. Managed by the cis_baseline Ansible role.
+# Do not edit by hand; changes will be overwritten on the next run.
+
+Port {{ cis_ssh_port }}
+
+# Protocol and access
+PermitRootLogin {{ cis_ssh_permit_root_login }}
+PubkeyAuthentication {{ cis_ssh_pubkey_authentication }}
+PasswordAuthentication {{ cis_ssh_password_authentication }}
+PermitEmptyPasswords {{ cis_ssh_permit_empty_passwords }}
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+UsePAM yes
+
+{% if cis_ssh_allow_users | length > 0 %}
+AllowUsers {{ cis_ssh_allow_users | join(' ') }}
+{% endif %}
+{% if cis_ssh_allow_groups | length > 0 %}
+AllowGroups {{ cis_ssh_allow_groups | join(' ') }}
+{% endif %}
+
+# Session limits
+MaxAuthTries {{ cis_ssh_max_auth_tries }}
+MaxSessions {{ cis_ssh_max_sessions }}
+LoginGraceTime {{ cis_ssh_login_grace_time }}
+ClientAliveInterval {{ cis_ssh_client_alive_interval }}
+ClientAliveCountMax {{ cis_ssh_client_alive_count_max }}
+
+# Forwarding. All off: a bastion should move sessions, not tunnels.
+X11Forwarding {{ cis_ssh_x11_forwarding }}
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+PermitUserEnvironment no
+GatewayPorts no
+
+# Logging. VERBOSE records the key fingerprint used for each login, which is what
+# turns "someone logged in as ubuntu" into "this specific key logged in".
+LogLevel VERBOSE
+SyslogFacility AUTHPRIV
+
+Banner {{ cis_ssh_banner_path }}
+
+# Modern cryptography only. These lists deliberately exclude CBC ciphers,
+# SHA1 based MACs and small Diffie-Hellman groups.
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256

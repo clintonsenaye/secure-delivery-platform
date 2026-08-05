@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  role_name: cis_baseline
+  author: secure-delivery-platform
+  description: >-
+    CIS Level 1 basics for Ubuntu: SSH hardening, UFW firewall, auditd,
+    unattended security upgrades and password policy.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+  galaxy_tags:
+    - security
+    - hardening
+    - cis
+    - ubuntu
+
+dependencies: []

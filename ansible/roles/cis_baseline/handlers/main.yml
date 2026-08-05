@@ -1,0 +1,24 @@
+---
+# Restart, not reload. sshd reload does not always re-read drop in files in
+# sshd_config.d. Existing sessions survive a restart, so this is safe.
+- name: Restart sshd
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+
+- name: Reload ufw
+  community.general.ufw:
+    state: reloaded
+
+# auditd deliberately ignores systemctl restart on some releases. The service
+# module with use=service is the reliable path.
+- name: Restart auditd
+  ansible.builtin.service:
+    name: auditd
+    state: restarted
+    use: service
+
+- name: Restart unattended-upgrades
+  ansible.builtin.service:
+    name: unattended-upgrades
+    state: restarted

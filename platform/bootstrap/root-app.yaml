@@ -1,0 +1,131 @@
+---
+##############################################################################
+# The root application. The one file applied by hand, exactly once.
+#
+#   kubectl apply -f platform/bootstrap/root-app.yaml
+#
+# After this, no human credential is used to deliver anything. The cluster
+# reads Git and applies it to itself.
+#
+# This is the same shape as terraform/bootstrap in chapter 1: something has to
+# point the self-managing system at its own configuration, and that one act
+# cannot itself be self-managed. The goal was never zero manual steps. It is
+# exactly one, performed against a committed file, idempotent, and reproducible
+# on a cluster rebuilt from nothing.
+##############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+
+##############################################################################
+# THERE IS DELIBERATELY NO FINALIZER ON THIS APPLICATION.
+#
+# Adding resources-finalizer.argocd.argoproj.io to the metadata below would make
+# `kubectl delete application root -n argocd` a cascading delete: ArgoCD would
+# delete every child Application, and each child's own finalizer would then
+# delete its workloads. One command, six lines of YAML, and the entire platform
+# is gone.
+#
+# Without the finalizer, deleting this object removes only this object. Every
+# child Application keeps existing and keeps syncing. Nothing stops serving and
+# no user notices. What is lost is reconciliation of the LIST of applications:
+# new entries in platform/apps/ are not picked up, removed ones are not pruned,
+# and a hand deleted child is not restored. That is a real hazard of its own,
+# because the cluster looks entirely healthy while silently no longer being
+# GitOps.
+#
+# Recovery is to re-apply this file. ArgoCD finds the children already present
+# and already matching Git, marks them Synced, and adopts them. No downtime, no
+# recreation.
+#
+# The decision is about asymmetry, not about which failure is nicer:
+#
+#   with the finalizer     one keystroke  ->  total platform outage
+#   without the finalizer  one keystroke  ->  silent no-op, fixed by one
+#                                             idempotent command
+#
+# The children DO carry the finalizer, so deleting an app's file from Git still
+# tears its workloads down properly rather than orphaning them. Deliberate
+# deletion works. Accidental catastrophe does not.
+#
+# The cost, stated plainly: tearing the whole platform down is now a two step
+# act rather than one command. That is the intended trade, and it is why
+# `make argocd-down` deletes the children explicitly before uninstalling.
+##############################################################################
+
+metadata:
+  name: root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: secure-delivery-platform
+
+spec:
+  project: default
+
+  source:
+    # HTTPS, not SSH, and no credentials of any kind.
+    #
+    # This repository is public, so ArgoCD clones it anonymously. That is not a
+    # shortcut, it is the point: the credential inventory for this chapter has
+    # no Git entry at all. Nothing to store, nothing to rotate, nothing to leak.
+    #
+    # A private repository would need a read only deploy key held as a Secret in
+    # the cluster. Still far less privileged than cluster write access, but it
+    # would put one more long lived secret on the list.
+    repoURL: https://github.com/clintonsenaye/secure-delivery-platform.git
+
+    # Tracks the default branch. Any merge to main reaches the cluster within
+    # one reconciliation interval.
+    #
+    # Correct for one cluster with one operator. A real promotion pipeline would
+    # pin this to a tag or a per environment branch, so that a merge to main
+    # does not deploy to production without a deliberate promotion step.
+    targetRevision: main
+
+    # THE PATH THAT MAKES THE PATTERN WORK.
+    #
+    # platform/apps/ contains ONLY Application objects. Nothing else. The
+    # workload manifests they point at live in platform/manifests/, which this
+    # application never reads.
+    #
+    # If a Deployment were placed under platform/apps/, this root application
+    # would apply it directly into the argocd namespace, bypassing the child
+    # Application that was supposed to own it. The separation is structural
+    # rather than a naming convention, so it cannot be got wrong by accident.
+    path: platform/apps
+    directory:
+      recurse: true
+
+  destination:
+    # https://kubernetes.default.svc is ArgoCD's name for the cluster it is
+    # itself running in. No kubeconfig, no endpoint, no credential: it uses the
+    # ServiceAccount token the kubelet projects into its own pod.
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # Delete from the cluster what has been deleted from Git. Without this,
+      # Git is only additive, which is a half truth wearing the costume of a
+      # source of truth.
+      prune: true
+      # Undo changes made directly to the cluster. This is what makes a manual
+      # kubectl edit a temporary act rather than a permanent undocumented one.
+      selfHeal: true
+
+    syncOptions:
+      # Delete owners before dependents, and wait. The default orphans
+      # ReplicaSets and pods behind a deleted Deployment.
+      - PrunePropagationPolicy=foreground
+      # Prune removed resources only after the new ones are healthy, so a
+      # rename does not open a gap in service.
+      - PruneLast=true
+      # Apply with server side apply, so field ownership is tracked by the API
+      # server and ArgoCD does not fight other controllers over shared objects.
+      - ServerSideApply=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

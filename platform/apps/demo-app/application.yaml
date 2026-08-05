@@ -1,0 +1,69 @@
+---
+##############################################################################
+# demo-app: the first child application.
+#
+# This file is deployed BY the root application, not by hand. Adding a second
+# component to the platform means adding one more directory here containing one
+# more file like this one. That is a pull request, reviewed and merged, with no
+# cluster access and no ArgoCD login required by whoever opens it.
+#
+# Everything under platform/apps/ must be an Application and nothing else. The
+# workload manifests this points at live in platform/manifests/demo-app/.
+##############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  # Explicitly argocd. Applications are only reconciled when they live in the
+  # namespace the controller watches, which is set by application.namespaces in
+  # platform/argocd/values.yaml. Relying on the parent's destination namespace
+  # to supply this would work and would be invisible.
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: secure-delivery-platform
+
+  # The child DOES carry the finalizer, unlike the root application.
+  #
+  # This is what makes deletion work properly in the intended direction: remove
+  # this file from platform/apps/ in Git, the root application prunes this
+  # Application, this finalizer fires, and the Deployment, Service and Namespace
+  # in platform/manifests/demo-app/ are deleted with it. Without the finalizer
+  # they would be orphaned: still running, owned by nothing, invisible to Git.
+  #
+  # See platform/bootstrap/root-app.yaml for why the root deliberately does not
+  # have one.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/clintonsenaye/secure-delivery-platform.git
+    targetRevision: main
+    # Plain YAML in a directory. No Helm chart, no Kustomize overlay.
+    #
+    # Both are the right answer once there is more than one environment and the
+    # manifests need to vary between them. With one cluster and one environment
+    # they add a templating layer between the reader and the resource, and this
+    # chapter is trying to show the mechanism rather than hide it.
+    path: platform/manifests/demo-app
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

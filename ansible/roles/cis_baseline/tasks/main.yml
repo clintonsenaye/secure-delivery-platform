@@ -1,0 +1,28 @@
+---
+# Order matters. The firewall is configured before SSH is restarted, so a rule
+# set that would lock us out is caught while the current session is still open.
+
+- name: Include SSH hardening
+  ansible.builtin.include_tasks: ssh.yml
+  when: cis_manage_ssh | bool
+  tags: [cis, ssh]
+
+- name: Include firewall configuration
+  ansible.builtin.include_tasks: firewall.yml
+  when: cis_manage_firewall | bool
+  tags: [cis, firewall, ufw]
+
+- name: Include auditd configuration
+  ansible.builtin.include_tasks: auditd.yml
+  when: cis_manage_auditd | bool
+  tags: [cis, auditd, audit]
+
+- name: Include unattended upgrades
+  ansible.builtin.include_tasks: updates.yml
+  when: cis_manage_updates | bool
+  tags: [cis, updates, patching]
+
+- name: Include password policy
+  ansible.builtin.include_tasks: password_policy.yml
+  when: cis_manage_password_policy | bool
+  tags: [cis, passwords, pam]

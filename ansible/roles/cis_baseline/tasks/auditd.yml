@@ -1,0 +1,78 @@
+---
+# auditd.
+#
+# The kernel audit subsystem records syscall level events. This is the layer that
+# answers "who changed /etc/sudoers and when", and it is the reason a compromised
+# host still produces evidence. It is also the section most likely to be skipped
+# in a real environment, which is why it is worth having here.
+
+- name: Install auditd and its rule tooling
+  ansible.builtin.apt:
+    name:
+      - auditd
+      - audispd-plugins
+    state: present
+
+- name: Configure auditd log rotation and disk behaviour
+  ansible.builtin.template:
+    src: auditd.conf.j2
+    dest: /etc/audit/auditd.conf
+    owner: root
+    group: root
+    mode: "0640"
+    validate: /bin/true
+  notify: Restart auditd
+
+# Rules live in a numbered drop in file under rules.d. augenrules compiles every
+# file in that directory into the loaded rule set at boot, in filename order.
+- name: Deploy CIS audit rules
+  ansible.builtin.template:
+    src: cis.rules.j2
+    dest: /etc/audit/rules.d/50-cis.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart auditd
+  register: cis_audit_rules
+
+- name: Recompile the audit rule set
+  ansible.builtin.command: augenrules --load
+  when:
+    - cis_audit_rules.changed
+    - not ansible_check_mode
+  changed_when: true
+  # A rule referring to a syscall the kernel does not have returns non-zero but
+  # still loads everything else. Failing the play on that is not useful.
+  failed_when: false
+
+- name: Ensure auditd is enabled and running
+  ansible.builtin.service:
+    name: auditd
+    state: started
+    enabled: true
+    use: service
+
+# Records what the kernel did before auditd itself started. Without this, the gap
+# between kernel handover and auditd launch is unaudited, which is exactly the
+# window an attacker with boot access would use.
+- name: Enable auditing for processes that start before auditd
+  ansible.builtin.replace:
+    path: /etc/default/grub
+    regexp: '^(GRUB_CMDLINE_LINUX=(?!.*\baudit=1\b)"[^"]*)"'
+    replace: '\1 audit=1"'
+  register: cis_grub_audit
+  notify: Restart auditd
+
+- name: Rebuild the grub configuration
+  ansible.builtin.command: update-grub
+  when:
+    - cis_grub_audit.changed
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Report that a reboot is needed for boot time auditing
+  ansible.builtin.debug:
+    msg: >-
+      The grub command line was changed to enable audit=1. This takes effect on
+      the next reboot. The role does not reboot hosts by itself.
+  when: cis_grub_audit.changed

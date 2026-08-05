@@ -1,0 +1,203 @@
+---
+# The demo service.
+#
+# This file is the one to edit during the rollback demonstration: change
+# GREETING, commit, push, and watch the cluster follow. See docs/architecture.md
+# section 21.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+    app.kubernetes.io/part-of: secure-delivery-platform
+spec:
+  # Two replicas so a rolling update is visible on camera and so the two kind
+  # workers both have something scheduled on them.
+  replicas: 2
+
+  # maxUnavailable 0 means the new pod must be Ready before an old one is
+  # removed, so a rolling update never dips below the declared replica count.
+  # On a two node cluster this needs maxSurge to be non-zero or the rollout
+  # deadlocks with nowhere to put the surge pod.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  # How long a new ReplicaSet has to become available before the Deployment is
+  # marked failed. The default is 600s, which is a long time to watch a broken
+  # rollout during a demonstration.
+  progressDeadlineSeconds: 120
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-app
+        app.kubernetes.io/part-of: secure-delivery-platform
+      annotations:
+        # Read by a Prometheus scrape config using the standard kubernetes_sd
+        # pod role. Nothing scrapes these yet. They are here so that chapter 5
+        # is a matter of installing Prometheus rather than editing every
+        # workload in the repository.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      # Pod level security context. Applies to every container in the pod and to
+      # any volume the pod mounts.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          # RuntimeDefault applies the container runtime's default seccomp
+          # filter, which blocks roughly forty rarely used syscalls that show up
+          # far more often in exploits than in applications. Unconfined, which
+          # is the default when this field is absent, blocks nothing.
+          type: RuntimeDefault
+
+      # Spread the two replicas across the two kind workers. whenUnsatisfiable
+      # is ScheduleAnyway rather than DoNotSchedule, so a single node cluster
+      # still schedules both pods instead of leaving one Pending forever. A
+      # scheduling preference should degrade, not deadlock.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: demo-app
+
+      # The default ServiceAccount token is mounted into every pod unless this
+      # is set. This application never calls the Kubernetes API, so mounting a
+      # credential for it hands an attacker a cluster credential for nothing in
+      # return.
+      automountServiceAccountToken: false
+
+      # Long enough for the 15 second graceful shutdown in main.go to finish
+      # with room to spare.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: demo-app
+
+          # No registry prefix and IfNotPresent, because in chapter 2 the image
+          # is built locally and side-loaded into the kind nodes with
+          # `kind load docker-image`. It is never pulled.
+          #
+          # This is the honest gap in this chapter: the manifests are in Git and
+          # provably so, the image bytes are not. They came from a laptop and
+          # nothing verifies them. Chapter 3 replaces this with a digest
+          # reference to a signed image in a registry, and an admission policy
+          # that refuses anything unsigned.
+          image: demo-app:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # The rollback demonstration changes this value. It is the visible
+            # thing that proves a git revert reached the cluster.
+            - name: GREETING
+              value: "Chapter 2: the cluster pulls from Git"
+
+            # Downward API. The pod does not need cluster API access to learn
+            # its own identity, so it is given it directly. This is what puts a
+            # changing pod name on the greeting page during the self-healing
+            # demonstration.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            # Reported at /version. IMAGE_DIGEST is deliberately absent in
+            # chapter 2, so /version reports it as unset rather than claiming a
+            # provenance it does not have. Chapter 3 sets it to the digest that
+            # was signed and verified at admission.
+            - name: IMAGE_REF
+              value: demo-app:0.1.0
+
+          # Container level security context. The pod level one above cannot
+          # express these, because they are properties of the container.
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            # A read only root filesystem turns "write a payload to disk and run
+            # it" into an error. The application writes nothing, so this costs
+            # nothing. A process that needs scratch space gets an emptyDir
+            # rather than a writable root.
+            readOnlyRootFilesystem: true
+            capabilities:
+              # Drop every Linux capability. Binding to port 8080 rather than 80
+              # is what makes this possible: ports below 1024 would need
+              # NET_BIND_SERVICE.
+              drop: [ALL]
+
+          # Requests are what the scheduler reserves; limits are what the
+          # kernel enforces. Both are set because a workload without requests is
+          # scheduled as though it were free, and a workload without limits can
+          # starve its neighbours on a laptop sized cluster.
+          #
+          # No CPU limit is set on purpose. CPU limits throttle rather than kill,
+          # and a throttled process under the CFS quota can see latency spikes
+          # far worse than the contention the limit was meant to prevent. The
+          # memory limit is set, because memory is not compressible and the only
+          # remedy for exhausting it is the OOM killer.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+
+          # Three probes, doing three different jobs. Conflating them is the
+          # most common probe mistake.
+          #
+          # startup:   is it up yet? Suppresses the other two until it passes,
+          #            so a slow start is not mistaken for a failure.
+          # readiness: should it receive traffic? Failing removes the pod from
+          #            the Service endpoints without killing it.
+          # liveness:  is it wedged? Failing kills the container. This is the
+          #            dangerous one: too aggressive and a slow dependency turns
+          #            into a restart loop that makes the outage worse.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 1
+            failureThreshold: 30
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3

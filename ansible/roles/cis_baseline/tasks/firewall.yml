@@ -1,0 +1,98 @@
+---
+# UFW firewall.
+#
+# ORDER IS THE WHOLE POINT OF THIS FILE.
+#
+# Setting a default deny policy and enabling UFW before an allow rule exists for
+# SSH will drop your own connection, and on a cloud VM with no console that means
+# the host is gone. So: install, allow SSH, allow everything else, and only then
+# enable. Every task below is sequenced around that.
+
+- name: Ensure ufw is installed
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+# FIRST. Before any default policy is set and before ufw is enabled.
+- name: Allow SSH before anything else
+  community.general.ufw:
+    rule: allow
+    port: "{{ cis_ssh_port }}"
+    proto: tcp
+    comment: "SSH - must always be present"
+
+- name: Allow the remaining required ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    comment: "{{ item.comment | default('managed by cis_baseline') }}"
+  loop: "{{ cis_ufw_allowed_rules }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto | default('tcp') }}"
+
+# Loopback traffic must be explicitly permitted. A default deny policy without
+# these rules breaks any process that talks to itself over 127.0.0.1, which is
+# most of them.
+- name: Allow loopback in
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: lo
+
+- name: Allow loopback out
+  community.general.ufw:
+    rule: allow
+    direction: out
+    interface: lo
+
+# Blocks a classic spoofing trick: a packet arriving on a real interface claiming
+# to come from 127.0.0.0/8.
+- name: Deny spoofed loopback traffic from other interfaces
+  community.general.ufw:
+    rule: deny
+    direction: in
+    from_ip: 127.0.0.0/8
+
+- name: Set default outgoing policy
+  community.general.ufw:
+    direction: outgoing
+    policy: "{{ cis_ufw_default_outgoing }}"
+
+# Only now, with SSH already allowed above.
+- name: Set default incoming policy to deny
+  community.general.ufw:
+    direction: incoming
+    policy: "{{ cis_ufw_default_incoming }}"
+
+- name: Enable ufw logging
+  community.general.ufw:
+    logging: "{{ cis_ufw_logging }}"
+
+- name: Enable ufw
+  community.general.ufw:
+    state: enabled
+
+- name: Ensure ufw starts on boot
+  ansible.builtin.service:
+    name: ufw
+    enabled: true
+    state: started
+
+# Belt and braces. Confirms SSH really is reachable through the rule set before
+# the play moves on, rather than discovering it on the next connection attempt.
+- name: Verify the SSH port is permitted in the active rule set
+  ansible.builtin.command: ufw status
+  register: cis_ufw_status
+  changed_when: false
+  check_mode: false
+
+- name: Assert SSH survived the firewall configuration
+  ansible.builtin.assert:
+    that:
+      - cis_ssh_port | string in cis_ufw_status.stdout
+    fail_msg: >-
+      Port {{ cis_ssh_port }} is not present in the active ufw rule set. Do not
+      disconnect from this host until that is fixed.
+    success_msg: "Port {{ cis_ssh_port }} is permitted in the active ufw rule set."
+  when: not ansible_check_mode

@@ -1,0 +1,105 @@
+---
+# Every section can be switched off independently, so the role can be adopted
+# gradually on an existing host rather than all at once.
+cis_manage_ssh: true
+cis_manage_firewall: true
+cis_manage_auditd: true
+cis_manage_updates: true
+cis_manage_password_policy: true
+
+##############################################################################
+# SSH
+##############################################################################
+
+# The single most important control in the role. Root has no password to
+# brute force and no key, so a compromised credential still needs a second step
+# (sudo) to reach root.
+cis_ssh_permit_root_login: "no"
+
+# Keys only. Password authentication is the attack surface almost every
+# opportunistic SSH scan is looking for.
+cis_ssh_password_authentication: "no"
+cis_ssh_pubkey_authentication: "yes"
+cis_ssh_permit_empty_passwords: "no"
+
+cis_ssh_port: 22
+cis_ssh_x11_forwarding: "no"
+cis_ssh_max_auth_tries: 4
+cis_ssh_max_sessions: 10
+cis_ssh_login_grace_time: 60
+
+# Idle sessions are disconnected after 300 x 3 = 15 minutes.
+cis_ssh_client_alive_interval: 300
+cis_ssh_client_alive_count_max: 3
+
+# Empty means every user may log in. Populate to restrict, for example ["ubuntu"].
+cis_ssh_allow_users: []
+cis_ssh_allow_groups: []
+
+cis_ssh_banner_path: /etc/issue.net
+
+##############################################################################
+# Firewall (UFW)
+##############################################################################
+
+cis_ufw_default_incoming: deny
+cis_ufw_default_outgoing: allow
+cis_ufw_logging: "low"
+
+# SSH is added automatically from cis_ssh_port and must never be removed from
+# the effective rule set. Everything else is listed here.
+cis_ufw_allowed_rules:
+  - { port: 80, proto: tcp, comment: "HTTP" }
+  - { port: 443, proto: tcp, comment: "HTTPS" }
+
+##############################################################################
+# auditd
+##############################################################################
+
+# Halting or going read only on a full audit disk is the strict CIS answer, but
+# it turns a disk space problem into an outage. Rotating is the pragmatic choice
+# and is called out in docs/architecture.md as a deliberate deviation.
+cis_auditd_max_log_file: 32
+cis_auditd_num_logs: 5
+cis_auditd_max_log_file_action: ROTATE
+cis_auditd_space_left_action: SYSLOG
+cis_auditd_admin_space_left_action: SUSPEND
+cis_auditd_disk_full_action: SYSLOG
+
+##############################################################################
+# Unattended upgrades
+##############################################################################
+
+cis_unattended_upgrades_enabled: true
+
+# Security updates only. Pulling in every update unattended is how a Tuesday
+# morning outage happens.
+cis_unattended_security_only: true
+cis_unattended_remove_unused_dependencies: true
+
+# OFF by default and deliberately so. A surprise 03:00 reboot is its own kind of
+# incident. Turn it on per host group where a reboot is genuinely safe.
+cis_unattended_automatic_reboot: false
+cis_unattended_automatic_reboot_time: "03:00"
+
+##############################################################################
+# Password policy
+##############################################################################
+
+cis_password_min_length: 14
+cis_password_dcredit: -1 # at least 1 digit
+cis_password_ucredit: -1 # at least 1 uppercase
+cis_password_lcredit: -1 # at least 1 lowercase
+cis_password_ocredit: -1 # at least 1 special character
+cis_password_retry: 3
+cis_password_remember: 5 # cannot reuse the last 5 passwords
+
+cis_password_max_days: 365
+cis_password_min_days: 1
+cis_password_warn_age: 7
+cis_password_inactive_days: 30
+
+# Account lockout after repeated failures, to blunt online brute force.
+cis_faillock_deny: 5
+cis_faillock_unlock_time: 900 # 15 minutes
+cis_faillock_root_unlock_time: 60

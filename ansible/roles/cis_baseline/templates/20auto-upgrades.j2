@@ -1,0 +1,15 @@
+// {{ ansible_managed }}
+// Managed by the cis_baseline Ansible role.
+
+// Refresh the package lists daily. Without this, the upgrade timer has nothing
+// new to act on.
+APT::Periodic::Update-Package-Lists "1";
+
+// Run the unattended upgrade daily.
+APT::Periodic::Unattended-Upgrade "{{ '1' if cis_unattended_upgrades_enabled else '0' }}";
+
+// Download upgradeable packages daily so the install step is quick.
+APT::Periodic::Download-Upgradeable-Packages "1";
+
+// Clear the local package cache weekly so /var does not fill up.
+APT::Periodic::AutocleanInterval "7";

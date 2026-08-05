@@ -1,0 +1,45 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# The bootstrap root module deliberately uses LOCAL state, because it creates the
+# very S3 bucket that every other root module stores its state in. That state file
+# is never committed. See README.md, "Bootstrapping the state backend", for why
+# this is safe: the bootstrap is fully reproducible from code, and if the state
+# file is lost the two resources can be re-imported in about a minute.
+terraform/bootstrap/terraform.tfstate
+terraform/bootstrap/terraform.tfstate.backup
+
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored. The provider dependency
+# lock file must be committed so every machine and every CI run resolves the exact
+# same provider versions and checksums. Ignoring it is a common mistake.
+
+# Real variable values and backend config. Only the .example files are committed.
+*.tfvars
+!*.tfvars.example
+*.auto.tfvars
+backend.hcl
+
+# Ansible
+ansible/inventory/hosts.ini
+*.retry
+.vault_pass
+
+# Tooling output
+.checkov.baseline
+results_*.json
+report_*.json
+
+# Local editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

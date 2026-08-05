@@ -1,0 +1,59 @@
+---
+# Local development cluster. Costs nothing.
+#
+# This is the daily driver. EKS costs roughly $0.18/hour whether or not anything
+# is running on it, so the workflow is: build and iterate here, and only spend
+# money on AWS when you specifically need real IAM, real IRSA or a real load
+# balancer.
+#
+#   make up      creates it
+#   make down    deletes it
+#
+# What this can do: everything Kubernetes. Deployments, ArgoCD, admission
+# policies, ingress, image signature verification against a local registry.
+# What it cannot do: IRSA, ECR, ALB, anything that needs the AWS control plane.
+# That boundary is exactly where chapter 2 and 3 will need the real cluster.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: secure-delivery
+
+networking:
+  # Explicit rather than left to chance, so it does not collide with the
+  # 10.0.0.0/16 used by the dev VPC if you ever run both and route between them.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+  # Bind the API server to loopback only. There is no reason for a local
+  # development cluster to be reachable from the rest of the network.
+  apiServerAddress: "127.0.0.1"
+
+nodes:
+  # One control plane. Multi control plane kind clusters exist but they consume
+  # roughly a gigabyte of RAM each for no benefit to this project.
+  - role: control-plane
+    kubeadmConfigPatches:
+      # Labels this node as ingress ready, which is the selector the standard
+      # ingress-nginx kind manifest uses for its node affinity.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # Maps host port 80 and 443 straight through to the node, so an ingress
+      # controller is reachable at http://localhost without port forwarding.
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+
+  # Two workers, so scheduling behaviour, pod anti affinity and node draining
+  # behave the way they would on the real cluster rather than trivially.
+  - role: worker
+    labels:
+      environment: local
+  - role: worker
+    labels:
+      environment: local

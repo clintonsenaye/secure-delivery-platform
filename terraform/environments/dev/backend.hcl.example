@@ -1,0 +1,9 @@
+# Copy to backend.hcl and set the bucket name printed by `make bootstrap`.
+# backend.hcl is gitignored because the bucket name embeds your AWS account ID.
+#
+#   terraform init -backend-config=backend.hcl
+
+bucket       = "secure-delivery-tfstate-123456789012-eu-west-2"
+region       = "eu-west-2"
+encrypt      = true
+use_lockfile = true

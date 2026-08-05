@@ -1,0 +1,102 @@
+# {{ ansible_managed }}
+# CIS Level 1 audit rules. Managed by the cis_baseline Ansible role.
+#
+# Each -w watch has a -k key. The key is what makes the log searchable:
+#   ausearch -k identity
+# Without keys you have a log you cannot query, which is the same as no log.
+
+# Discard any rules already loaded, so this file is authoritative.
+-D
+
+# Kernel event buffer. Too small and events are dropped under load, which means
+# silent gaps in the audit trail exactly when something interesting is happening.
+-b 8192
+
+# Rate limit, 0 = unlimited. Dropping events to protect performance would defeat
+# the purpose.
+-r 0
+
+## Time changes. Shifting the clock is a classic way to confuse a timeline.
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime,stime -k time-change
+-w /etc/localtime -p wa -k time-change
+
+## Identity. Who exists, who is in which group, who can become root.
+-w /etc/group -p wa -k identity
+-w /etc/passwd -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+
+## Sudo configuration and sudo usage.
+-w /etc/sudoers -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-w /var/log/sudo.log -p wa -k actions
+
+## Login and authentication records.
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/log/tallylog -p wa -k logins
+-w /var/run/utmp -p wa -k session
+-w /var/log/wtmp -p wa -k session
+-w /var/log/btmp -p wa -k session
+
+## Network configuration and the hostname.
+-a always,exit -F arch=b64 -S sethostname,setdomainname -k system-locale
+-a always,exit -F arch=b32 -S sethostname,setdomainname -k system-locale
+-w /etc/hosts -p wa -k system-locale
+-w /etc/hostname -p wa -k system-locale
+-w /etc/network/ -p wa -k system-locale
+-w /etc/netplan/ -p wa -k system-locale
+
+## SSH configuration. Directly relevant to this role's own controls.
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+
+## Mandatory access control.
+-w /etc/apparmor/ -p wa -k MAC-policy
+-w /etc/apparmor.d/ -p wa -k MAC-policy
+
+## Permission and ownership changes, ignoring unprivileged users' own files and
+## calls that failed with EPERM or EACCES, which would otherwise be pure noise.
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
+
+## Unsuccessful attempts to open files. This is where you see someone probing.
+-a always,exit -F arch=b64 -S open,openat,truncate,ftruncate,creat -F exit=-EACCES -F auid>=1000 -F auid!=4294967295 -k access
+-a always,exit -F arch=b64 -S open,openat,truncate,ftruncate,creat -F exit=-EPERM -F auid>=1000 -F auid!=4294967295 -k access
+
+## Mounts by ordinary users, which is one way to introduce untrusted binaries.
+-a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
+
+## File deletions and renames by ordinary users.
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=4294967295 -k delete
+
+## Kernel module loading. Loading a module is loading kernel level code.
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module,delete_module,finit_module -k modules
+
+## Privilege escalation binaries.
+-w /bin/su -p x -k privileged
+-w /usr/bin/sudo -p x -k privileged
+-w /usr/bin/passwd -p x -k privileged
+-w /usr/bin/chage -p x -k privileged
+-w /usr/sbin/usermod -p x -k privileged
+-w /usr/sbin/groupadd -p x -k privileged
+-w /usr/sbin/useradd -p x -k privileged
+
+## Cron and systemd timers, both common persistence mechanisms.
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron
+-w /etc/systemd/system/ -p wa -k systemd
+
+# Makes the rule set immutable until reboot. Nothing, not even root, can add or
+# remove audit rules while the system is running.
+#
+# COMMENTED OUT BY DEFAULT. It is the correct end state for a locked down
+# production host, but it means every subsequent Ansible run that touches audit
+# rules requires a reboot to take effect. Enable it once the rules have settled.
+# -e 2

@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+#
+# This environment is PLAN ONLY. `make plan ENV=prod` works; apply and destroy
+# are blocked in the Makefile.
+
+owner = "clinton-senaye"
+
+# Required even for a plan, because the variable has no default anywhere in this
+# repository. In a real production environment this would be a corporate VPN
+# egress range or a bastion subnet, not a home broadband address.
+public_access_cidrs = ["203.0.113.10/32"]
+
+# Optional overrides.
+# nat_gateway_count = 2   # one per AZ, the correct production choice
+# cluster_version   = "1.34"

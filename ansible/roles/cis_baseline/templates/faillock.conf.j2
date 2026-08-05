@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+# Managed by the cis_baseline Ansible role.
+#
+# pam_faillock replaced pam_tally2, which was removed in Ubuntu 22.04. Writing a
+# pam_tally2 configuration on a modern release silently does nothing at all,
+# which is worse than having no lockout, because it looks like it is working.
+
+# Failed attempts before the account is locked.
+deny = {{ cis_faillock_deny }}
+
+# Window in which those failures must occur, in seconds.
+fail_interval = 900
+
+# How long the lock lasts. 900 seconds rather than permanent, deliberately: a
+# permanent lock turns a forgotten password into a support ticket, and turns an
+# attacker who knows a valid username into a denial of service against that user.
+unlock_time = {{ cis_faillock_unlock_time }}
+
+# Root is locked too, but briefly. A permanently locked root on a cloud VM with
+# no console is unrecoverable.
+even_deny_root
+root_unlock_time = {{ cis_faillock_root_unlock_time }}
+
+# Record every failure to the audit log, so lockouts are visible.
+audit
+
+# Show the user how many attempts remain.
+silent = 0

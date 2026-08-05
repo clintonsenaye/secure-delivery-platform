@@ -1,0 +1,36 @@
+---
+# The namespace is a committed manifest rather than an ArgoCD sync option.
+#
+# ArgoCD offers CreateNamespace=true, which makes the controller create the
+# destination namespace on the fly. It works, and it puts a small permanent hole
+# in this chapter's central claim: the namespace would exist in the cluster
+# without existing in Git, so nothing reconciles it and prune would never remove
+# it. Declaring it here keeps "Git is the whole truth" literally true.
+#
+# ArgoCD sorts Namespace ahead of workloads in its default apply ordering, so no
+# sync wave annotation is needed to get the ordering right.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    app.kubernetes.io/part-of: secure-delivery-platform
+
+    # Pod Security Admission, which is built into Kubernetes and needs nothing
+    # installed. "restricted" is the strictest of the three built-in levels: it
+    # requires non-root, a seccomp profile, all capabilities dropped and no
+    # privilege escalation.
+    #
+    # This is NOT the admission control chapter 3 is about. Chapter 3 adds a
+    # policy that rejects images whose signature cannot be verified, which is a
+    # claim about provenance. This is a claim about runtime privilege. They are
+    # complementary and neither substitutes for the other.
+    #
+    # It is here because the demo Deployment already satisfies every one of
+    # these constraints, so enforcing them costs nothing today and means a
+    # future manifest that quietly asks for root gets refused rather than
+    # scheduled.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,31 @@
+---
+# ClusterIP, not NodePort or LoadBalancer.
+#
+# The service is reached during the demonstrations with `kubectl port-forward`,
+# which tunnels over the Kubernetes API's own TLS connection and needs no
+# inbound path to the cluster. That suits a chapter whose argument is that the
+# cluster only ever dials out.
+#
+# A NodePort would work on kind and would open a port on the node for anything
+# that can reach it. An ingress controller is the right answer for a real
+# cluster and is deliberately not installed here, because it is a second thing
+# to explain and this chapter is about delivery, not routing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+    app.kubernetes.io/part-of: secure-delivery-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: demo-app
+  ports:
+    - name: http
+      port: 80
+      # Named rather than numbered. If the container port ever moves, it moves
+      # in one place in the Deployment and this file does not change.
+      targetPort: http
+      protocol: TCP

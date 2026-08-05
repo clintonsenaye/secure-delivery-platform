@@ -1,0 +1,91 @@
+---
+# SSH hardening.
+#
+# The settings are written to a drop in file under /etc/ssh/sshd_config.d/ rather
+# than by editing /etc/ssh/sshd_config directly. Two reasons:
+#   1. A package upgrade can replace the main config and silently revert the
+#      hardening. Drop in files survive.
+#   2. It is a single file to read, add or remove, which makes the change
+#      auditable and reversible.
+#
+# Ubuntu 22.04 and newer ship "Include /etc/ssh/sshd_config.d/*.conf" as the
+# FIRST line of sshd_config, and in OpenSSH the first occurrence of a keyword
+# wins. So a drop in file overrides the main config, not the other way round.
+
+- name: Ensure openssh-server is installed
+  ansible.builtin.apt:
+    name: openssh-server
+    state: present
+
+- name: Confirm sshd_config includes the drop in directory
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    line: "Include /etc/ssh/sshd_config.d/*.conf"
+    insertbefore: BOF
+    state: present
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd
+
+- name: Deploy the login banner
+  ansible.builtin.template:
+    src: issue.net.j2
+    dest: "{{ cis_ssh_banner_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# The critical task in the whole role.
+#
+# `validate` runs `sshd -t` against the candidate file BEFORE it is moved into
+# place. If the syntax is wrong, Ansible fails and the file is never installed,
+# so a typo cannot leave a host with a broken sshd that refuses every connection.
+# Without this, one bad character locks you out of a machine with no console.
+- name: Deploy SSH hardening drop in file
+  ansible.builtin.template:
+    src: 99-cis-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-cis-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd
+
+- name: Lock down SSH host key permissions
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - /etc/ssh/ssh_host_rsa_key
+    - /etc/ssh/ssh_host_ecdsa_key
+    - /etc/ssh/ssh_host_ed25519_key
+  # Not every host has every key type, and a missing key is not an error.
+  failed_when: false
+
+- name: Ensure sshd is enabled and running
+  ansible.builtin.service:
+    name: ssh
+    state: started
+    enabled: true
+
+# Fail loudly if the running daemon is not actually enforcing what we asked for.
+# This catches the case where another drop in file with a lower number wins.
+- name: Read the effective sshd configuration
+  ansible.builtin.command: sshd -T
+  register: cis_sshd_effective
+  changed_when: false
+  check_mode: false
+
+- name: Assert root login and password authentication are actually disabled
+  ansible.builtin.assert:
+    that:
+      - "'permitrootlogin no' in cis_sshd_effective.stdout | lower"
+      - "'passwordauthentication no' in cis_sshd_effective.stdout | lower"
+    fail_msg: >-
+      sshd is not enforcing the expected settings. Another file in
+      /etc/ssh/sshd_config.d/ may be sorting before 99-cis-hardening.conf.
+    success_msg: "sshd is enforcing key only authentication with root login disabled."
+  # The assertion is meaningless in check mode, because the new file has not been
+  # written and the daemon has not been restarted.
+  when: not ansible_check_mode

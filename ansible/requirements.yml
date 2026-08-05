@@ -1,0 +1,11 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+collections:
+  # Provides the ufw module used by roles/cis_baseline/tasks/firewall.yml.
+  - name: community.general
+    version: ">=8.0.0"
+
+  # Provides the posix modules used for mount and sysctl handling as the role
+  # grows in later chapters.
+  - name: ansible.posix
+    version: ">=1.5.0"

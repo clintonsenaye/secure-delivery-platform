@@ -1,0 +1,54 @@
+# Accepted risk register.
+#
+# Every entry here is a security finding this project has consciously decided not
+# to fix, with the reasoning written down. Checkov suppressions live inline next
+# to the resource they concern; Trivy suppressions live here, in one place, so
+# there is a single short document listing everything this platform has chosen to
+# accept. That list should stay short, and every line should be defensible out
+# loud.
+#
+# Review these whenever the project's context changes. Three of the four are
+# purely cost decisions that stop applying the moment this stops being a
+# portfolio project.
+
+misconfigurations:
+  - id: AVD-AWS-0040
+    paths:
+      - "modules/cluster/main.tf"
+    statement: >-
+      "Public cluster access is enabled." Accepted, with a compensating control.
+      The public endpoint stays on so kubectl works from a laptop without running
+      a bastion host or a VPN, which would add both cost and complexity to a
+      single operator project. It is NOT open: access is restricted to
+      var.public_access_cidrs, a required variable with no default, whose
+      validation rule hard rejects 0.0.0.0/0. An open Kubernetes API is not
+      configurable in this repository. The production answer is
+      endpoint_public_access = false, reached through a bastion or a site to site
+      VPN, and that is documented in docs/architecture.md.
+
+  - id: AVD-AWS-0039
+    paths:
+      - "modules/cluster/main.tf"
+    statement: >-
+      "Cluster does not have secret encryption enabled." Accepted for now, on
+      cost grounds. Envelope encryption of Kubernetes Secrets is implemented
+      behind var.kms_key_arn (see the dynamic encryption_config block) but is off
+      by default, because a customer managed KMS key costs roughly $1/month and
+      this chapter stores no Secrets worth protecting. This is turned on in
+      chapter 3, when signing keys and registry credentials enter the cluster.
+      etcd is already encrypted at rest by AWS with an AWS owned key; this
+      control protects against a different threat, namely someone who can read an
+      etcd snapshot but has no KMS grant.
+
+  - id: AVD-AWS-0132
+    paths:
+      - "bootstrap/main.tf"
+    statement: >-
+      "Bucket does not encrypt data with a customer managed key." Accepted on
+      cost grounds. The Terraform state bucket uses SSE-S3 (AES256), which is
+      free, rather than SSE-KMS, which adds per request charges on every state
+      read and write. SSE-KMS buys key rotation policy and cross account grants,
+      neither of which a single account project needs. The bucket also has
+      versioning, a full public access block and a bucket policy denying any non
+      TLS request, so the residual risk is narrow: it would require an attacker
+      who already has S3 read access to the bucket.

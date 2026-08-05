@@ -1,0 +1,175 @@
+---
+##############################################################################
+# ArgoCD Helm values.
+#
+# This file is committed so that the install is reproducible rather than a
+# command someone once ran and half remembers. `make argocd-up` installs the
+# pinned chart version with exactly these values, and running it twice produces
+# the same cluster.
+#
+# Chart version is pinned in the Makefile as ARGOCD_CHART_VER, currently 10.2.3
+# (ArgoCD v3.5.0). Pinning matters for the same reason .terraform.lock.hcl is
+# committed in chapter 1: an unpinned install resolves to whatever is newest on
+# the day it runs, which is not a build, it is a coincidence.
+#
+# Values marked LOCAL ONLY are correct for a laptop and wrong for production.
+# Each says what production would do instead.
+##############################################################################
+
+global:
+  # Applied to every component the chart deploys. The chart's own defaults are
+  # weaker than this, and a platform that will enforce runtime constraints on
+  # other people's workloads should not ship unconstrained pods itself.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    seccompProfile:
+      type: RuntimeDefault
+
+configs:
+  params:
+    # LOCAL ONLY.
+    #
+    # Serve the API and UI over plain HTTP inside the cluster.
+    #
+    # The UI is reached with `kubectl port-forward`, which is already an
+    # encrypted tunnel through the Kubernetes API server. Running TLS inside
+    # that tunnel means ArgoCD presents a self signed certificate, so every
+    # demonstration begins by teaching the viewer to click through a browser
+    # certificate warning. That is a worse security outcome than the plaintext
+    # hop between the port-forward and the pod, which never leaves the host.
+    #
+    # An interviewer will notice this line. The answer is above, and the
+    # production answer is below.
+    #
+    # PRODUCTION: leave this false, put an ingress in front, terminate TLS there
+    # with a real certificate from cert-manager, and never port-forward.
+    server.insecure: true
+
+    # Quieter logs. The default is info and is very chatty on a small cluster.
+    application.namespaces: argocd
+
+  cm:
+    # LOCAL ONLY.
+    #
+    # How often the application controller re-reads Git. The default is 180s.
+    #
+    # In production you leave it at 180s and configure a webhook, so a push
+    # triggers a sync immediately and the poll is only a backstop. A webhook
+    # needs GitHub to open an inbound connection to ArgoCD, which is impossible
+    # here by design: the kind cluster has no inbound path, which is the entire
+    # security argument of this chapter.
+    #
+    # So on kind the only lever is the poll interval. 30s keeps the rollback
+    # demonstration watchable without three minutes of dead air. The cost is
+    # more Git API calls, which for one small repository is nothing and at
+    # organisational scale would be rate limited.
+    timeout.reconciliation: 30s
+
+    # Setting the interval alone is not enough, and this one is easy to miss.
+    #
+    # ArgoCD adds a random jitter of up to this value on top of the interval, so
+    # that a controller managing hundreds of applications does not stampede Git
+    # every time the interval elapses. The chart default is 60s, which would
+    # have made the real poll interval 30 to 90 seconds and the rollback
+    # demonstration unpredictable on camera.
+    #
+    # 5s keeps the spread tight. PRODUCTION: leave the default. Thundering herd
+    # protection exists for a reason and one repository is not a fleet.
+    timeout.reconciliation.jitter: 5s
+
+    # Used to build links in the UI and in notifications. The chart default is
+    # argocd.example.com, which produces links that go nowhere.
+    url: http://localhost:8081
+
+    # Stop ArgoCD reporting a permanent diff on fields the cluster itself
+    # rewrites. Without this, every Application with a CRD sits at OutOfSync
+    # forever and people learn to ignore the status, which defeats the point of
+    # having one.
+    resource.compareoptions: |
+      ignoreAggregatedRoles: true
+      ignoreResourceStatusField: all
+
+  # The chart generates a random admin password into a Secret at install time.
+  # It is not set here, because a password committed to a public repository is
+  # not a password. Read it with `make argocd-password`.
+  #
+  # After first login the correct move is to change it and delete the
+  # argocd-initial-admin-secret, which is why the Makefile prints that reminder.
+  secret:
+    createSecret: true
+
+##############################################################################
+# Components.
+#
+# Everything not needed is switched off. Fewer pods on a laptop, and less
+# attack surface on a component that holds broad cluster rights.
+##############################################################################
+
+dex:
+  # Single sign on. There is one operator and no identity provider, so this is
+  # a pod doing nothing. PRODUCTION: enable it and turn off local accounts
+  # entirely, so access is governed by the corporate directory.
+  enabled: false
+
+notifications:
+  # Slack, email and webhook notifications on sync events. Nothing to notify.
+  enabled: false
+
+applicationSet:
+  # Generates Applications from templates, for example one per cluster or one
+  # per directory. The app-of-apps pattern in this chapter does the same job
+  # explicitly with one committed file per application, which is easier to read
+  # and easier to review. Worth revisiting once there are many similar apps.
+  #
+  # NOTE THE KEY. Unlike dex and notifications, this component has no `enabled`
+  # flag in chart 10.2.3, and `replicas: 0` is the only lever the chart offers.
+  #
+  # This matters beyond this one setting: Helm silently ignores any value the
+  # chart does not define. `applicationSet.enabled: false` produces no error, no
+  # warning and no effect, and the controller keeps running while the values
+  # file claims otherwise. It was caught by checking the running cluster against
+  # this file rather than trusting that setting a value did something.
+  #
+  # The Deployment still exists at zero replicas, along with its RBAC. Removing
+  # those needs a post-render hook, which is more machinery than a stopped pod
+  # is worth.
+  replicas: 0
+
+redis:
+  # Single instance. redis-ha is three sentinels plus three replicas and is
+  # pointless on a one machine cluster.
+  enabled: true
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+controller:
+  # The application controller: the component that actually reconciles Git
+  # against the cluster. One replica. PRODUCTION: shard it once the number of
+  # managed clusters or applications makes one controller the bottleneck.
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+
+repoServer:
+  # Clones Git and renders manifests. This is the component that makes the
+  # outbound connection to GitHub.
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 128Mi}
+    limits: {memory: 256Mi}
+
+server:
+  # The API and UI.
+  replicas: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 128Mi}
+
+  # No ingress. The UI is reached with `make argocd-ui`, which port-forwards to
+  # localhost:8081. 8080 and 8443 on this host are already taken by the kind
+  # node's port mappings.
+  ingress:
+    enabled: false

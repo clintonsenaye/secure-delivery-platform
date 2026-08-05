@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored so your IP
+# address is never committed.
+
+owner = "your-name"
+
+# REQUIRED. Your public IP as a /32. There is no default, deliberately.
+#   curl -s https://checkip.amazonaws.com
+# Home broadband addresses change, so expect an occasional plan diff here.
+public_access_cidrs = ["203.0.113.10/32"]
+
+# Optional overrides.
+# aws_region        = "eu-west-2"
+# cluster_version   = "1.35"
+# nat_gateway_count = 1
