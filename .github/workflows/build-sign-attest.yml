@@ -1,7 +1,7 @@
 ---
 ##############################################################################
 # build-sign-attest
-#
+## Pipeline first executed against main on 6 August 2026.
 # Chapter 3. The pipeline that lets the cluster refuse everything else.
 #
 # THE CLAIM THIS WORKFLOW EXISTS TO BACK UP:
