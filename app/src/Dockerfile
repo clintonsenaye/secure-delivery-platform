@@ -35,7 +35,7 @@
 # resolves differently on different days is not reproducible, and reproducibility
 # is the whole premise.
 ##############################################################################
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 
