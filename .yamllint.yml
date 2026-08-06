@@ -7,6 +7,12 @@ rules:
     level: warning
   truthy:
     allowed-values: ["true", "false", "yes", "no"]
+    # Chapter 3. GitHub Actions workflows are keyed on `on:`, which YAML 1.1
+    # treats as a boolean and yamllint therefore flags on every workflow file.
+    # Quoting it as "on": is legal and is a thing nobody writing a workflow does,
+    # so the check is turned off for keys rather than the files being made odd.
+    # Values are still checked, which is where the real footguns live.
+    check-keys: false
   comments:
     min-spaces-from-content: 1
   braces:

@@ -1,0 +1,260 @@
+---
+##############################################################################
+# terraform-plan
+#
+# Runs the same quality gates `make lint` runs locally, plus a real
+# `terraform plan` against the PLAN ONLY prod environment, on every pull
+# request.
+#
+# WHY THIS FILE EXISTS.
+#
+# docs/architecture.md section 10 argues that prod is worth keeping even though
+# it is never applied, because a plan type checks the whole configuration,
+# resolves every module input and output, and catches real errors against a real
+# AWS account. That argument only holds if the plan actually runs. Until this
+# workflow existed, prod was a directory somebody had to remember to plan by
+# hand, which is another way of saying it was dead code with a good excuse.
+#
+# This turns it into a continuously verified specification.
+#
+# THE ROLE THIS ASSUMES IS NOT THE ROLE THE BUILD USES.
+#
+# It is a second, read only role created by the same Terraform module. That
+# separation is the point. A pull request can be opened by anyone, including from
+# a fork by somebody with no write access to this repository, and a pull request
+# run receives the OIDC subject claim `repo:owner/name:pull_request`. The build
+# role's trust policy does not accept that claim, so an untrusted pull request
+# cannot obtain credentials that can push an image. It can only look.
+#
+# The read only role also cannot acquire the S3 state lock, because acquiring the
+# lock means writing a .tflock object. Hence -lock=false below.
+#
+# CONFIGURATION
+#
+#   Repository variable AWS_PLAN_ROLE_ARN   from `make ci-config`
+#   Repository variable TF_STATE_BUCKET     from `make ci-config`
+#   Repository variable AWS_REGION          optional, defaults to eu-west-2
+##############################################################################
+
+name: terraform-plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: terraform-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
+  TF_IN_AUTOMATION: 'true'
+  # Terraform prints a slightly different, quieter output when it knows it is
+  # not attached to a terminal, and never prompts.
+  TF_INPUT: '0'
+
+jobs:
+  ##########################################################################
+  # Static checks. No credential of any kind. Runs even on forks.
+  ##########################################################################
+  static:
+    name: Format, validate and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: '1.14.4'
+          # The wrapper intercepts stdout to expose it as a step output. It also
+          # mangles multi line plan output, and this workflow does not need the
+          # outputs, so it is off.
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive terraform/
+
+      - name: terraform validate, every module and environment
+        run: |
+          set -euo pipefail
+          for d in terraform/modules/* terraform/environments/* terraform/bootstrap; do
+            [ -f "$d/versions.tf" ] || continue
+            echo "==> $d"
+            # -backend=false so validate needs no credential and no state. This
+            # job deliberately holds neither.
+            terraform -chdir="$d" init -backend=false -input=false > /dev/null
+            terraform -chdir="$d" validate
+          done
+
+      - name: yamllint
+        run: |
+          set -euo pipefail
+          pipx install yamllint >/dev/null 2>&1 || pip install --quiet yamllint
+          yamllint -c .yamllint.yml ansible/ kind/ platform/ policies/ .github/
+
+      - name: Checkov
+        run: |
+          set -euo pipefail
+          pipx install checkov >/dev/null 2>&1 || pip install --quiet checkov
+          # Suppressions live inline as #checkov:skip comments carrying a written
+          # reason, so a suppression is a documented argument rather than a
+          # silent exclusion. See docs/architecture.md section 11.
+          checkov --directory terraform/ \
+                  --framework terraform \
+                  --quiet --compact \
+                  --download-external-modules false
+
+      - name: Trivy config and secret scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: terraform/
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          trivyignores: .trivyignore.yaml
+
+  ##########################################################################
+  # The real plan, against a real AWS account, with a read only role.
+  #
+  # Skipped on pull requests from forks, because a fork's run cannot access
+  # repository variables and would fail on an empty role ARN. The static job
+  # above still runs, so a fork gets meaningful feedback.
+  ##########################################################################
+  plan:
+    name: Plan ${{ matrix.env }}
+    needs: static
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      id-token: write
+      contents: read
+      # To write the plan summary onto the pull request.
+      pull-requests: write
+
+    strategy:
+      # One environment failing should not hide the result for the others.
+      fail-fast: false
+      matrix:
+        env: [ci, dev, prod]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: '1.14.4'
+          terraform_wrapper: false
+
+      - name: Assume the read only plan role via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: terraform init
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          # backend.hcl is gitignored, because the bucket name embeds the AWS
+          # account ID. The values are supplied here from a repository variable
+          # instead, which is the same partial backend pattern the Makefile uses
+          # locally.
+          terraform -chdir="terraform/environments/${{ matrix.env }}" init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform plan
+        id: plan
+        env:
+          # Required variables that have no default anywhere in this repository.
+          #
+          # public_access_cidrs is documentation range TEST-NET-3, not a real
+          # address. A plan is a type and shape check; the value only has to be a
+          # syntactically valid CIDR that is not 0.0.0.0/0, which the variable's
+          # validation rule rejects outright. Using a placeholder here is
+          # deliberate, so a CI log never publishes a home IP address.
+          TF_VAR_owner: github-actions
+          TF_VAR_public_access_cidrs: '["203.0.113.10/32"]'
+        run: |
+          set -euo pipefail
+          # -lock=false because the role assumed above is genuinely read only and
+          # cannot write the .tflock object. A plan does not mutate state, so the
+          # only risk forgone is reading a state file mid write, which produces a
+          # confusing plan rather than a corrupt one. A read only role that can
+          # still write a lock file is not a read only role.
+          #
+          # -detailed-exitcode: 0 no changes, 1 error, 2 changes present. Changes
+          # are expected and are not a failure, so only 1 fails the step.
+          set +e
+          terraform -chdir="terraform/environments/${{ matrix.env }}" plan \
+            -input=false -lock=false -no-color -detailed-exitcode \
+            > plan.txt 2>&1
+          code=$?
+          set -e
+
+          echo "::group::terraform plan (${{ matrix.env }})"
+          cat plan.txt
+          echo "::endgroup::"
+
+          if [ "$code" -eq 1 ]; then
+            echo "Plan failed for ${{ matrix.env }}."
+            exit 1
+          fi
+
+          {
+            echo "### terraform plan: ${{ matrix.env }}"
+            echo
+            if [ "$code" -eq 0 ]; then
+              echo "No changes. Infrastructure matches the configuration."
+            else
+              echo "Changes present."
+            fi
+            echo
+            echo '<details><summary>Plan output</summary>'
+            echo
+            echo '```terraform'
+            # Trimmed, because a full EKS plan is thousands of lines and a pull
+            # request comment has a size limit.
+            tail -c 60000 plan.txt
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note that prod is plan only
+        if: matrix.env == 'prod'
+        run: |
+          {
+            echo
+            echo "> prod is **never applied**. \`make apply ENV=prod\` refuses,"
+            echo "> enforced in the Makefile rather than left to discipline."
+            echo "> This plan exists so production sizing is continuously"
+            echo "> verified without paying roughly \$185/month for an idle"
+            echo "> cluster. See docs/architecture.md section 10."
+          } >> "$GITHUB_STEP_SUMMARY"

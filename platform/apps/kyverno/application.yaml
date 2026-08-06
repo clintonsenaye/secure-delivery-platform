@@ -1,0 +1,211 @@
+---
+##############################################################################
+# kyverno: the policy engine. Chapter 3.
+#
+# Kyverno is an ADMISSION CONTROLLER: it registers a webhook with the Kubernetes
+# API server, so every create and update in scope is sent to it for a decision
+# BEFORE the object is written to etcd. Policies are Kubernetes resources rather
+# than code, which is what lets them live in Git next to everything else.
+#
+# This Application installs the engine. The policies it enforces are a separate
+# Application, platform/apps/kyverno-policies/, for two reasons:
+#
+#   1. The policies are Custom Resources whose CustomResourceDefinitions this
+#      chart installs. They cannot be applied until it has.
+#   2. Changing a policy should not risk redeploying the engine, and upgrading
+#      the engine should not require touching a policy.
+#
+# THE ORDERING PROBLEM, AND WHY SYNC WAVES FINALLY APPEAR HERE
+#
+# docs/architecture.md section 22 lists "no sync waves or custom health checks"
+# as a known gap, with the note that they would be needed "the moment something
+# ships CRDs that another app depends on". This is that moment.
+#
+# ArgoCD applies resources in ascending sync wave order and waits for each wave
+# to become Healthy before starting the next. The waves across this platform:
+#
+#   -2  kyverno            the engine and its CRDs
+#   -1  kyverno-policies   the ClusterPolicy objects
+#    0  demo-app           the workload the policies gate
+#
+# Without them, a cluster rebuilt from nothing would race: the demo app could be
+# admitted in the window before the policies exist. Nothing would appear wrong,
+# because the pods would be running and every Application would report Synced and
+# Healthy. The gate would simply not have been consulted, which is the worst
+# failure mode a security control has.
+##############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: secure-delivery-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+
+  # The child carries the finalizer, like demo-app and unlike the root
+  # application. See platform/bootstrap/root-app.yaml.
+  #
+  # Worth pausing on for this app in particular: deleting this file from Git
+  # removes the admission controller, and with it every guarantee chapter 3
+  # makes. It would not break anything visibly. The demo app would keep running
+  # and the cluster would keep reporting healthy. That is exactly why the ArgoCD
+  # Project restriction named as a gap in section 22 matters more from this
+  # chapter onwards.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  project: default
+
+  source:
+    # A Helm chart from the upstream repository rather than a vendored copy.
+    #
+    # The version is PINNED, for the same reason ARGOCD_CHART_VER is pinned in
+    # the Makefile and .terraform.lock.hcl is committed: an install that resolves
+    # to whatever is newest on the day it runs is a coincidence, not a build.
+    #
+    # Check for newer releases with:
+    #   helm search repo kyverno/kyverno --versions
+    repoURL: https://kyverno.github.io/kyverno/
+    chart: kyverno
+    targetRevision: 3.8.2  # Kyverno v1.18.2
+
+    helm:
+      releaseName: kyverno
+
+      # Values inline rather than in a separate file, because there are few
+      # enough to read in one go and keeping them here means the Application and
+      # its configuration cannot drift apart.
+      valuesObject:
+        # One replica of each controller. The chart defaults to three for the
+        # admission controller, which is correct for production and is three
+        # times the memory on a laptop running kind.
+        #
+        # Note what this costs, because it is not nothing: with one replica and
+        # failurePolicy: Fail, a restart of that single pod is a brief window
+        # where admissions to the demo namespace are refused. On a real cluster
+        # this is three replicas across three nodes with a PodDisruptionBudget.
+        # NOTE THE INCONSISTENCY, because it is a real trap in this chart and it
+        # is exactly the failure docs/architecture.md section 19 describes for
+        # the ArgoCD chart.
+        #
+        # The admission controller takes its resources under
+        # `admissionController.container.resources`. The background and reports
+        # controllers take theirs at the TOP level, as
+        # `backgroundController.resources`. Writing
+        # `admissionController.resources` is the obvious guess, it is wrong, and
+        # Helm accepts it silently: no error, no warning, no effect. The pod
+        # would run with the chart's defaults while this file claimed otherwise.
+        #
+        # Verified against `helm show values kyverno/kyverno --version 3.8.2`
+        # rather than assumed. A Helm values file is a set of requests, not a
+        # specification.
+        admissionController:
+          replicas: 1
+          container:
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+              limits:
+                memory: 384Mi
+
+        backgroundController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+        # Produces PolicyReport objects, which are how a policy decision stays
+        # visible after the terminal scrollback is gone. The bypass
+        # demonstration in docs/demonstrations.md reads them.
+        reportsController:
+          enabled: true
+          replicas: 1
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+        # Removes resources on a TTL. Nothing here uses it, so it is one fewer
+        # pod and one fewer thing holding cluster wide delete permission.
+        cleanupController:
+          enabled: false
+
+        # Prometheus metrics are exposed by default and a metrics Service is
+        # created by default, so there is nothing to switch on here. No
+        # ServiceMonitor, because nothing scrapes yet. Same position as the demo
+        # app's /metrics endpoint: present so that adding Prometheus later is an
+        # install rather than an edit to every component.
+
+        config:
+          # Namespaces Kyverno will never apply policies to, regardless of what a
+          # policy says. The chart's defaults already exclude kube-system and
+          # Kyverno's own namespace, which prevents the two obvious ways to
+          # deadlock a cluster: a policy that stops the control plane's own pods
+          # starting, and a policy that stops Kyverno restarting itself.
+          #
+          # Stated explicitly because it is also a bypass route. Anything that
+          # can schedule a pod into an excluded namespace escapes the gate
+          # completely. See docs/architecture.md section 28.
+          excludeKyvernoNamespace: true
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+    syncOptions:
+      # Kyverno's CustomResourceDefinitions are enormous. Client side apply
+      # stores the previous configuration in the
+      # kubectl.kubernetes.io/last-applied-configuration annotation, and
+      # annotations are capped at 262144 bytes, so a client side apply of these
+      # CRDs fails outright. Server side apply has no such limit and is already
+      # this platform's default. Without it the very first sync fails with a
+      # metadata size error that reads like a cluster problem.
+      - ServerSideApply=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+
+      # The chart creates the namespace itself, unlike demo-app whose namespace
+      # is a committed manifest. The inconsistency is deliberate: a Helm chart
+      # that manages its own namespace should be left to do so, because fighting
+      # it means a permanent diff on labels the chart sets.
+      - CreateNamespace=true
+
+      # The webhook configurations Kyverno registers are mutated by Kyverno
+      # itself at runtime as policies come and go. Without this, ArgoCD sees the
+      # controller's own edits as drift and self-heal fights the controller in a
+      # loop.
+      - RespectIgnoreDifferences=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # The admission and background controllers own the caBundle field of their own
+  # webhook configurations, rotating the certificate periodically. ArgoCD must
+  # not treat that as drift.
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle

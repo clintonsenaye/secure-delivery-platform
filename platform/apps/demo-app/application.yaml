@@ -22,6 +22,24 @@ metadata:
   labels:
     app.kubernetes.io/part-of: secure-delivery-platform
 
+  annotations:
+    # Chapter 3. Sync wave 0: after kyverno at -2 and kyverno-policies at -1.
+    #
+    # ArgoCD applies resources in ascending wave order and waits for each wave to
+    # become Healthy before starting the next. Without this, a cluster rebuilt
+    # from nothing would race, and the demo app could be admitted in the window
+    # before the policies exist.
+    #
+    # That failure is quiet, which is what makes it worth an annotation. The pods
+    # would run, every Application would report Synced and Healthy, and the gate
+    # would simply not have been consulted. A security control that is skipped
+    # looks exactly like one that passed.
+    #
+    # Zero is the default, so this line changes nothing about the behaviour. It
+    # is here because the ordering is now load bearing and an ordering that
+    # depends on a default is an ordering nobody knows about.
+    argocd.argoproj.io/sync-wave: "0"
+
   # The child DOES carry the finalizer, unlike the root application.
   #
   # This is what makes deletion work properly in the intended direction: remove

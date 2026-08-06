@@ -1,0 +1,176 @@
+---
+##############################################################################
+# require-provenance
+#
+# The second half of the gate. Where require-signed-images.yaml asks WHO signed
+# this, this file asks WHAT was built, FROM WHERE, and BY WHAT.
+#
+# WHY BOTH, WHEN THE SIGNATURE ALREADY PROVES THE BUILDER
+#
+# A signature is a statement that an identity vouched for some bytes. It carries
+# no detail. If the build workflow were tricked into signing an artefact it did
+# not build, for example an image supplied by a compromised third party action,
+# the signature would be perfectly valid and the provenance would not match.
+#
+# The two checks fail differently, which is the entire argument for defence in
+# depth. They are not the same check written twice.
+#
+# WHAT SLSA PROVENANCE IS
+#
+# SLSA, pronounced salsa, is "Supply chain Levels for Software Artefacts". Build
+# provenance is a signed, structured record of how an artefact was produced:
+# which repository, which commit, which workflow file, which builder, when.
+#
+# The property that makes it worth anything is that the BUILD PLATFORM generates
+# it, not the workflow. GitHub attests to what it observed. A provenance document
+# a workflow writes about itself is a self assessment, and a compromised workflow
+# writes a flattering one.
+#
+# DENY, NOT AUDIT. Same as require-signed-images.yaml.
+##############################################################################
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-provenance
+  annotations:
+    policies.kyverno.io/title: Require SLSA build provenance
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Rejects any pod in the demo namespace whose image does not carry a SLSA v1
+      build provenance attestation, signed by this repository's build workflow
+      identity, whose contents record that it was built from this repository on
+      the main branch by the expected workflow.
+
+spec:
+  # See require-signed-images.yaml for the reasoning on all three of these. They
+  # are identical on purpose: two policies gating the same namespace with
+  # different failure behaviour would produce a cluster whose actual guarantee is
+  # whichever policy is weaker.
+  failurePolicy: Fail
+  webhookTimeoutSeconds: 30
+  background: false
+
+  rules:
+    - name: verify-slsa-provenance
+
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - demo
+
+      verifyImages:
+        # "*" rather than a registry pattern, for the reason set out at length in
+        # require-signed-images.yaml: a narrow imageReferences pattern does not
+        # mean "check our images", it means "admit everything else unchecked".
+        - imageReferences:
+            - "*"
+
+          required: true
+          verifyDigest: true
+          mutateDigest: true
+
+          # The GitHub attestation is stored beside the image using the OCI 1.1
+          # referrers API rather than as a cosign style .sig tag.
+          #
+          # THIS IS THE FIDDLIEST INTEROPERABILITY POINT IN THE CHAPTER, and it
+          # is the first thing to flip if provenance verification fails while the
+          # signature policy passes. Registries that do not implement the
+          # Referrers API fall back to a tag schema, and Kyverno has to be told
+          # which convention to look for.
+          cosignOCI11: true
+
+          # Same 12 hour ECR token as the signature policy. See that file, and
+          # docs/architecture.md section 27, for why this row exists on kind and
+          # disappears on EKS.
+          imageRegistryCredentials:
+            allowInsecureRegistry: false
+            secrets:
+              - ecr-pull
+
+          attestations:
+            # The predicate type identifies the SCHEMA of the signed statement.
+            # SLSA v1 is what actions/attest-build-provenance produces.
+            - type: https://slsa.dev/provenance/v1
+              predicateType: https://slsa.dev/provenance/v1
+
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        # The same workflow identity the signature policy pins,
+                        # and it must stay in step with it. Emitted as the
+                        # Terraform output `cosign_certificate_identity`; print
+                        # it with `make ci-config`.
+                        #
+                        # Because this repository is PUBLIC, GitHub signs the
+                        # attestation using the public good Sigstore instance, so
+                        # the certificate comes from the same Fulcio and the
+                        # entry lands in the same public Rekor. A PRIVATE
+                        # repository would use GitHub's internal Fulcio instance
+                        # and a GitHub timestamp authority instead, and both the
+                        # issuer and the rekor block below would have to change.
+                        # Worth knowing before someone flips the repository to
+                        # private and cannot work out why nothing deploys.
+                        subject: "https://github.com/clintonsenaye/secure-delivery-platform/.github/workflows/build-sign-attest.yml@refs/heads/main"
+                        issuer: "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: https://rekor.sigstore.dev
+
+              # REQUIRING PROVENANCE WITHOUT READING IT IS CHECKING THAT A
+              # PASSPORT EXISTS WITHOUT OPENING IT.
+              #
+              # A provenance attestation that honestly records "built from
+              # somebody else's repository, on a branch you have never heard of"
+              # is a completely valid attestation. Without these conditions the
+              # policy would accept it, having verified only that a document of
+              # the right shape was present and correctly signed.
+              #
+              # The keys are JMESPath expressions evaluated against the SLSA v1
+              # predicate. Inspect a real one with:
+              #
+              #   cosign download attestation <image>@<digest> \
+              #     | jq -r .payload | base64 -d | jq .predicate
+              #
+              # A further tightening deliberately NOT applied: pinning
+              # runDetails.builder.id to the GitHub hosted runner would
+              # additionally reject a build from a self hosted runner. It is left
+              # out because the exact value is a GitHub implementation detail
+              # that has changed before, and a policy that breaks on a vendor's
+              # internal rename fails closed for the wrong reason. Noted so the
+              # omission reads as a decision rather than an oversight.
+              conditions:
+                - all:
+                    # Built by a GitHub Actions workflow, rather than by some
+                    # other build system that also emits SLSA v1.
+                    - key: "{{ buildDefinition.buildType }}"
+                      operator: Equals
+                      value: "https://actions.github.io/buildtypes/workflow/v1"
+
+                    # FROM THIS REPOSITORY. The single most important condition
+                    # here, and the one that catches an artefact built elsewhere
+                    # and signed by a confused workflow.
+                    - key: "{{ buildDefinition.externalParameters.workflow.repository }}"
+                      operator: Equals
+                      value: "https://github.com/clintonsenaye/secure-delivery-platform"
+
+                    # From the main branch. A build from a feature branch is a
+                    # legitimate build and is not something this cluster runs.
+                    - key: "{{ buildDefinition.externalParameters.workflow.ref }}"
+                      operator: Equals
+                      value: "refs/heads/main"
+
+                    # By the expected workflow file. Redundant with the
+                    # certificate subject above, and deliberately so: one is a
+                    # property of the certificate, the other a property of the
+                    # signed payload, and an attack that manages to control one
+                    # has to control the other as well.
+                    - key: "{{ buildDefinition.externalParameters.workflow.path }}"
+                      operator: Equals
+                      value: ".github/workflows/build-sign-attest.yml"
+
+      failureAction: Enforce

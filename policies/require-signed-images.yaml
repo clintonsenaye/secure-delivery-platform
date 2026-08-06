@@ -1,0 +1,222 @@
+---
+##############################################################################
+# require-signed-images
+#
+# THE GATE. Everything else in chapter 3 exists to produce the evidence this
+# file checks.
+#
+# In one sentence: no container runs in the demo namespace unless its image
+# carries a valid Cosign signature made by THIS repository's build workflow.
+#
+# DENY, NOT AUDIT. failureAction is Enforce, so a failing resource is rejected
+# at admission rather than recorded and allowed. An audit policy that nobody
+# reads is a dashboard, not a control.
+#
+# READ THE THREE COMMENTS MARKED "THE TRAP". Each is a way of writing this
+# policy that looks correct, passes a casual review, and protects nothing.
+##############################################################################
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  annotations:
+    policies.kyverno.io/title: Require signed images
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Rejects any pod in the demo namespace whose image does not carry a valid
+      Cosign keyless signature issued to this repository's build workflow
+      identity. Verification is by digest: the signature is over the content, not
+      over a tag, so it cannot be transferred to different bytes.
+
+spec:
+  # THE WEBHOOK FAILURE POLICY, and it is a genuine trade rather than a default.
+  #
+  #   Fail    Kyverno unreachable  ->  nothing is admitted in the demo namespace
+  #   Ignore  Kyverno unreachable  ->  EVERYTHING is admitted, silently
+  #
+  # Ignore turns the gate into a suggestion, and worse, into a suggestion that
+  # still reports green. An attacker who can disrupt the policy engine gets a
+  # free pass and no alert. Fail is chosen, and the cost is stated plainly: while
+  # Kyverno is down, deployments to this namespace stop. That is an availability
+  # risk this project accepts, and it is written up in docs/architecture.md
+  # section 28 rather than left for someone to discover during an incident.
+  failurePolicy: Fail
+
+  # Verification means a round trip to ECR for the signature and to Rekor for the
+  # transparency log entry. The default 10 seconds is comfortable on a good day
+  # and marginal on a slow one, and a timeout under failurePolicy: Fail is an
+  # outage. 30 is the maximum the API server allows.
+  webhookTimeoutSeconds: 30
+
+  # Background scanning off.
+  #
+  # Background scans re-evaluate existing resources on a schedule. For an image
+  # verification rule that means re-pulling signatures from the registry for
+  # every pod, repeatedly, with registry credentials, to produce a report about
+  # pods that were already admitted. The verification that matters happens at
+  # admission, which is the only moment a decision can still be made.
+  background: false
+
+  rules:
+    - name: verify-cosign-signature
+
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+
+              # SCOPED TO ONE NAMESPACE. Deliberately, and it is a real limit.
+              #
+              # Every other namespace on this cluster, including kube-system and
+              # argocd, is completely unprotected by this policy. Kyverno itself
+              # runs an image this policy has never looked at.
+              #
+              # That is the right scope for a chapter demonstrating the
+              # mechanism, and it is the wrong scope for a real platform, where
+              # the pattern is to enforce cluster wide and carve out the handful
+              # of namespaces that genuinely cannot comply. Listed as a known gap
+              # in docs/architecture.md section 30.
+              namespaces:
+                - demo
+
+      verifyImages:
+        # THE TRAP, ONE: scoping imageReferences to your own registry.
+        #
+        # It is tempting to write:
+        #
+        #   imageReferences:
+        #     - "*.dkr.ecr.*.amazonaws.com/secure-delivery-ci/app*"
+        #
+        # which reads as "verify our images". What it actually means is "verify
+        # only images matching this pattern, and admit everything else without
+        # checking". A pod referencing docker.io/library/nginx, or an attacker's
+        # image in an attacker's registry, matches nothing and is admitted with
+        # no verification at all. The policy would report as passing while
+        # enforcing nothing against the one image that mattered.
+        #
+        # "*" is the correct value. Nothing runs in this namespace that is not
+        # built by this pipeline, so everything must be signed by it. If a
+        # genuine exception ever arrives, for example a sidecar from a vendor,
+        # skipImageReferences is where it goes, as an explicit, reviewable,
+        # single line entry rather than as a hole in the match pattern.
+        - imageReferences:
+            - "*"
+
+          # required: true means a MISSING signature is a failure.
+          #
+          # With required: false, an image with no signature at all passes,
+          # because there was nothing to disagree with. That default exists for
+          # gradual rollout and it is the opposite of what this policy is for.
+          required: true
+
+          # Insist the reference carries a digest.
+          verifyDigest: true
+
+          # Rewrite a tag reference to the digest it resolved to at verification
+          # time, and put that digest into the pod spec.
+          #
+          # In this repository the manifests already reference digests, so this
+          # is normally a no-op. It matters for anything applied by hand. Without
+          # it there is a window between "Kyverno resolved the tag and verified
+          # those bytes" and "the kubelet resolved the same tag and pulled
+          # whatever it pointed at by then". Mutating the spec closes that
+          # window: the kubelet is given the exact digest that was verified.
+          mutateDigest: true
+
+          # Credentials for reading the signature out of ECR.
+          #
+          # This is the one credential chapter 3 adds back to the cluster, and it
+          # exists only because this runs on kind. See docs/architecture.md
+          # section 27.
+          #
+          # ON EKS this whole block becomes:
+          #
+          #   imageRegistryCredentials:
+          #     providers: [amazon]
+          #
+          # which uses the ECR credential helper against the pod's IRSA role, and
+          # no secret exists at all. On kind there is no AWS identity to assume,
+          # so a docker config secret is created from `aws ecr get-login-password`
+          # by `make ecr-login`. That token lasts TWELVE HOURS and then image
+          # verification starts failing with what looks like a signature error
+          # and is actually a 401. Refresh it with `make ecr-login`.
+          imageRegistryCredentials:
+            allowInsecureRegistry: false
+            secrets:
+              - ecr-pull
+
+          attestors:
+            # count: 1 means one entry must verify. With several entries and no
+            # count, ANY one satisfying the rule is enough, which is right for
+            # "either of two release workflows" and wrong for "both a developer
+            # and a release manager". Stated because the default surprises
+            # people.
+            - count: 1
+              entries:
+                # KEYLESS. There is no public key here because there is no
+                # private key anywhere.
+                #
+                # The build workflow generates a keypair in memory, presents its
+                # GitHub OIDC token to Fulcio, receives a certificate valid for
+                # ten minutes that binds the public key to the identity below,
+                # signs, records the event in Rekor, and throws the private key
+                # away. Verification checks that the signature was made by a
+                # certificate Fulcio issued to THIS identity, and that Rekor
+                # holds an entry timestamped inside that certificate's ten minute
+                # window.
+                #
+                # What replaces the key is an identity plus a timestamp. See
+                # docs/architecture.md section 25.
+                - keyless:
+                    # THE TRAP, TWO: a wildcard subject.
+                    #
+                    # subject: "*" is in a great many published examples. It
+                    # accepts a signature from ANY GitHub Actions workflow in ANY
+                    # repository on GitHub, which is a marginally higher bar than
+                    # accepting anything at all. Anyone can create a repository
+                    # and a workflow.
+                    #
+                    # This exact string is what makes the policy mean something.
+                    # It is also emitted as the Terraform output
+                    # `cosign_certificate_identity`, so it can be checked against
+                    # the infrastructure rather than against memory:
+                    #
+                    #   make ci-config
+                    #
+                    # A mismatch here produces "no matching signatures", which
+                    # reads like a signing failure and is a policy typo.
+                    subject: "https://github.com/clintonsenaye/secure-delivery-platform/.github/workflows/build-sign-attest.yml@refs/heads/main"
+
+                    # THE TRAP, THREE: omitting the issuer.
+                    #
+                    # The subject alone is a string in a certificate. Without
+                    # pinning who issued that certificate, a certificate for the
+                    # same subject string from a different OIDC provider would
+                    # satisfy the check. Subject and issuer are only meaningful
+                    # as a pair.
+                    issuer: "https://token.actions.githubusercontent.com"
+
+                    # The transparency log.
+                    #
+                    # Public good instance, because this repository is public and
+                    # the build workflow signs against the same instance. Rekor's
+                    # first job here is prosaic: the signing certificate expired
+                    # ten minutes after it was issued, and Rekor's signed
+                    # timestamp is the proof that the signature was made while it
+                    # was still valid. Its second job is the one the name
+                    # advertises, namely that a forged signature for this
+                    # identity would have to appear in a public append only log
+                    # where it could be found.
+                    #
+                    # It is also a hard availability dependency on a third party.
+                    # Rekor unreachable plus failurePolicy: Fail means no
+                    # deployments. Named in docs/architecture.md section 28.
+                    rekor:
+                      url: https://rekor.sigstore.dev
+
+      # Enforce, not Audit. The rule level field, which replaced the deprecated
+      # spec.validationFailureAction.
+      failureAction: Enforce
