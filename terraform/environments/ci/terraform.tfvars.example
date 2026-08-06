@@ -1,0 +1,41 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+#
+#   cp terraform/environments/ci/terraform.tfvars.example terraform/environments/ci/terraform.tfvars
+#
+# This environment costs roughly a penny a month and is meant to be applied once
+# and LEFT UP, which is the opposite of dev. It creates no cluster, no VPC and no
+# NAT gateway. See main.tf for why it is separate from dev.
+
+owner = "your-name"
+
+# The repository permitted to assume the IAM roles, as owner/name.
+#
+# This is the trust boundary of the entire pipeline. The IAM trust policy uses
+# StringEquals against a claim built from this value, so a typo produces a role
+# nobody can assume, which is the safe direction to fail in.
+github_repository = "clintonsenaye/secure-delivery-platform"
+
+# REQUIRED for a working `terraform plan` on pull requests. The ARN of the state
+# bucket created by `make bootstrap`:
+#
+#   cd terraform/bootstrap && terraform output -raw state_bucket_arn
+#
+# Gitignored along with the rest of this file, because it embeds the account ID.
+# state_bucket_arn = "arn:aws:s3:::secure-delivery-tfstate-123456789012-eu-west-2"
+
+# Optional overrides.
+#
+# aws_region        = "eu-west-2"
+# max_tagged_images = 30
+#
+# Branches whose workflow runs may push to ECR. Exact refs only: the trust policy
+# uses StringEquals, and widening this to a wildcard needs StringLike, which is a
+# moment to stop and think rather than a convenience.
+# github_push_refs = ["refs/heads/main"]
+#
+# Set to false if another project in this AWS account has already registered
+# GitHub as an OIDC provider. An account holds at most one per issuer URL.
+# create_github_oidc_provider = true
+#
+# Set to false to skip the read only role used by the terraform plan workflow.
+# create_plan_role = true

@@ -1,0 +1,105 @@
+---
+##############################################################################
+# Dependabot
+#
+# THIS FILE IS THE ANSWER TO THE OBVIOUS OBJECTION TO SHA PINNING.
+#
+# Every action in .github/workflows/ is pinned to a full commit SHA rather than
+# a tag, because a tag is a mutable pointer and a supply chain security pipeline
+# that trusts mutable tags for its own dependencies is arguing against itself.
+#
+# The fair objection is: "you have traded a supply chain risk for a staleness
+# risk. Nobody is going to hand update forty character hashes, so your actions
+# will be two years old and full of unpatched bugs."
+#
+# That objection is correct about human behaviour and wrong about the trade.
+# Dependabot understands SHA pinned actions specifically: it opens a pull request
+# that updates the SHA *and* the trailing version comment, so the pin stays
+# readable and the update goes through review like any other change.
+#
+# The point is not that updates stop happening. It is that they stop happening
+# invisibly.
+#
+# Note that this file only opens pull requests. Merging one still runs the full
+# gate in build-sign-attest.yml and terraform-plan.yml, and merging it to main
+# still triggers a rebuild that is signed and verified before anything deploys.
+# Dependabot has no more privilege than any other contributor.
+##############################################################################
+
+version: 2
+
+updates:
+  # GitHub Actions. The important one.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - supply-chain
+    groups:
+      # One pull request for all of them rather than five.
+      #
+      # Reviewing "here are this week's action updates" once is a review that
+      # actually happens. Five separate pull requests for five hashes is a
+      # rubber stamp with extra steps, which is worse than no review because it
+      # produces an audit trail suggesting somebody looked.
+      actions:
+        patterns:
+          - "*"
+
+  # The Go module the demo application depends on. Its vulnerabilities are what
+  # the Trivy filesystem scan in the gate job fails on, so an unpatched one
+  # blocks every build until somebody deals with it.
+  - package-ecosystem: gomod
+    directory: /app/src
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # The Dockerfile's base images: the Go toolchain and the distroless runtime.
+  #
+  # Worth knowing what this does NOT do. It updates the tag in the Dockerfile,
+  # for example golang:1.25-alpine to golang:1.26-alpine. It cannot pin those
+  # bases by digest, and this project does not either, which is an inconsistency
+  # with everything else in chapter 3 and is listed as a gap in
+  # docs/architecture.md section 30 rather than defended.
+  - package-ecosystem: docker
+    directory: /app/src
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # Terraform providers and modules. The lock file is committed deliberately,
+  # so a provider bump is a reviewable change rather than a surprise on whoever
+  # next runs init.
+  - package-ecosystem: terraform
+    directories:
+      - /terraform/environments/ci
+      - /terraform/environments/dev
+      - /terraform/environments/prod
+      - /terraform/modules/cluster
+      - /terraform/modules/github_oidc
+      - /terraform/modules/network
+      - /terraform/modules/registry
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "terraform"
+    labels:
+      - dependencies

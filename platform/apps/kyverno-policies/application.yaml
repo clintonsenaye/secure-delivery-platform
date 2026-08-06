@@ -1,0 +1,90 @@
+---
+##############################################################################
+# kyverno-policies: the gate itself. Chapter 3.
+#
+# Points at policies/ at the repository root, which holds exactly two
+# ClusterPolicy objects:
+#
+#   require-signed-images.yaml   deny anything without a valid Cosign signature
+#                                from this repository's build workflow identity
+#   require-provenance.yaml      deny anything without SLSA build provenance
+#                                recording that it was built from this
+#                                repository, on main, by that workflow
+#
+# WHY policies/ IS AT THE ROOT RATHER THAN UNDER platform/
+#
+# platform/apps/ may contain only Application objects, and platform/manifests/
+# holds workloads owned by a specific application. A ClusterPolicy is neither: it
+# is cluster scoped and it governs everything, including workloads that do not
+# exist yet. Giving it a top level directory makes it findable by someone opening
+# the repository to answer "what does this cluster refuse to run", which is the
+# first question chapter 3 invites.
+#
+# SYNC WAVE -1: after the engine at -2, before the workload at 0.
+#
+# Applying a ClusterPolicy before its CustomResourceDefinition exists fails with
+# "no matches for kind ClusterPolicy". Applying the workload before the policy
+# exists succeeds, which is worse, because the pods start unverified and
+# everything reports healthy.
+##############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: secure-delivery-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/clintonsenaye/secure-delivery-platform.git
+    targetRevision: main
+    path: policies
+    directory:
+      # Flat directory, deliberately. Two policies do not need a hierarchy, and a
+      # flat list is what makes "here is everything this cluster refuses" a
+      # single `ls`.
+      recurse: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    # ClusterPolicy is CLUSTER SCOPED, so this namespace is only where ArgoCD
+    # records the Application, not where the policies live. The policies
+    # themselves restrict their effect to the demo namespace through their own
+    # match blocks, which is the correct place for that decision: it is a
+    # property of the policy, not of how the policy was delivered.
+    namespace: kyverno
+
+  syncPolicy:
+    automated:
+      # prune: true means deleting a policy file from Git removes the policy from
+      # the cluster.
+      #
+      # WORTH SAYING OUT LOUD: that is a one line pull request that silently
+      # disables the entire supply chain gate, with no visible effect. Nothing
+      # stops serving, no alert fires, and every Application still reports Synced
+      # and Healthy. The mitigation is branch protection and review on this
+      # repository, which is a process control rather than a technical one, and
+      # it is named as a limit in docs/architecture.md section 28 rather than
+      # papered over.
+      prune: true
+      selfHeal: true
+
+    syncOptions:
+      - ServerSideApply=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

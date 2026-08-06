@@ -52,3 +52,27 @@ misconfigurations:
       versioning, a full public access block and a bucket policy denying any non
       TLS request, so the residual risk is narrow: it would require an attacker
       who already has S3 read access to the bucket.
+
+  # Chapter 3.
+  - id: AVD-AWS-0031
+    paths:
+      - "modules/registry/main.tf"
+    statement: >-
+      "ECR images should be set to IMMUTABLE." A scanner limitation rather than a
+      risk acceptance, and worth reading in full because it looks like a retreat
+      from chapter 1's central claim. The ci registry is set to
+      IMMUTABLE_WITH_EXCLUSION, a value AWS added in July 2025 that Trivy does
+      not yet recognise, so the check sees "not IMMUTABLE" and assumes the worst
+      case. The single exclusion is the wildcard sha256-*, and it exists because
+      cosign stores signatures and attestations AS TAGS derived from the digest
+      they describe. Attaching a second attestation updates one of those tags,
+      which a fully immutable repository refuses, so signing fails outright. The
+      alternative was setting the whole repository to MUTABLE, which would throw
+      away the guarantee this project calls load bearing. The exclusion is safe
+      for a specific reason rather than as a convenience: a sha256-* tag is
+      already content addressed, so writing one can only change metadata attached
+      to one exact digest and can never repoint a name at different bytes, which
+      is the attack immutability exists to prevent. Every application tag remains
+      immutable, and the dev environment is untouched and still fully IMMUTABLE
+      because the exclusion list defaults to empty. Argued in full in
+      docs/architecture.md section 26.

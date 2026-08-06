@@ -76,6 +76,12 @@ spec:
             matchLabels:
               app.kubernetes.io/name: demo-app
 
+      # Chapter 3. A dedicated ServiceAccount, whose only job is to carry the
+      # reference to the ECR pull secret so this file does not have to name a
+      # registry credential. See serviceaccount.yaml for why that secret exists
+      # on kind and disappears on EKS.
+      serviceAccountName: demo-app
+
       # The default ServiceAccount token is mounted into every pod unless this
       # is set. This application never calls the Kubernetes API, so mounting a
       # credential for it hands an attacker a cluster credential for nothing in
@@ -89,16 +95,42 @@ spec:
       containers:
         - name: demo-app
 
-          # No registry prefix and IfNotPresent, because in chapter 2 the image
-          # is built locally and side-loaded into the kind nodes with
-          # `kind load docker-image`. It is never pulled.
+          ##################################################################
+          # THIS LINE IS CHAPTER 3.
           #
-          # This is the honest gap in this chapter: the manifests are in Git and
-          # provably so, the image bytes are not. They came from a laptop and
-          # nothing verifies them. Chapter 3 replaces this with a digest
-          # reference to a signed image in a registry, and an admission policy
-          # that refuses anything unsigned.
-          image: demo-app:0.1.0
+          # It is written by .github/workflows/build-sign-attest.yml, which
+          # commits it here after the image has been built, scanned, attested
+          # and signed. Nothing else edits it, and nothing should.
+          #
+          # BY DIGEST, NEVER BY TAG. The whole chapter is in that distinction.
+          #
+          # In chapter 2 this said `demo-app:0.1.0`, an image side loaded into
+          # the kind nodes from a laptop. Two things were wrong with it. The
+          # first was that nothing verified those bytes at all. The second was
+          # subtler and bit before the first did: rebuilding the image under the
+          # same 0.1.0 tag left this file byte for byte identical, so Kubernetes
+          # compared the pod template, saw no change, and did nothing. The pods
+          # kept serving the old binary while every dashboard read Synced and
+          # Healthy. The system was correct and the deployment was a lie.
+          #
+          # A tag is a pointer and pointers move. A digest is the SHA256 of the
+          # image manifest, so it IS the content: change one byte and it is a
+          # different name. Nothing can be repointed, no rebuild is invisible,
+          # and the signature verified at admission is over these exact bytes
+          # rather than over a label somebody could reassign.
+          #
+          # THE VALUE BELOW IS A PLACEHOLDER until the pipeline has run once.
+          # `make argocd-up` checks for it and warns. On a fresh clone the
+          # sequence is: apply the ci Terraform, push to main, let the workflow
+          # finish, pull, and only then bring the cluster up.
+          ##################################################################
+          image: REPLACED-BY-PIPELINE.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+          # IfNotPresent is correct and cheap for a digest reference. A digest
+          # already in the node's image store can only be the bytes that digest
+          # names, so re-pulling could not possibly get anything different.
+          # Always would be pure network cost for zero freshness benefit, which
+          # is the opposite of the situation with a mutable tag.
           imagePullPolicy: IfNotPresent
 
           ports:
@@ -110,7 +142,7 @@ spec:
             # The rollback demonstration changes this value. It is the visible
             # thing that proves a git revert reached the cluster.
             - name: GREETING
-              value: "Chapter 2: the cluster pulls from Git"
+              value: "Chapter 3: signed, attested, and verified at admission"
 
             # Downward API. The pod does not need cluster API access to learn
             # its own identity, so it is given it directly. This is what puts a
@@ -129,12 +161,27 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
 
-            # Reported at /version. IMAGE_DIGEST is deliberately absent in
-            # chapter 2, so /version reports it as unset rather than claiming a
-            # provenance it does not have. Chapter 3 sets it to the digest that
-            # was signed and verified at admission.
+            # Reported at /version. Both values are written by the pipeline
+            # alongside the image reference above, and they close a promise
+            # chapter 2 made: /version shipped reporting image_digest as "unset",
+            # with a comment saying chapter 3 would fill it in.
+            #
+            # HOW MUCH TO TRUST THIS ENDPOINT, precisely. These are environment
+            # variables. The application reports what it was told, and a pod that
+            # lies about its own provenance is trivial to construct. What makes
+            # them meaningful is not the application, it is that they were
+            # written by the same commit that ArgoCD applied and that Kyverno
+            # verified the signature over the digest named here before the pod
+            # was allowed to exist. The endpoint is a convenient window onto a
+            # fact established elsewhere, not the evidence itself.
+            #
+            # The one provenance claim the application can make without trusting
+            # anyone is binary_sha256, which it computes of itself at runtime by
+            # reading /proc/self/exe.
             - name: IMAGE_REF
-              value: demo-app:0.1.0
+              value: REPLACED-BY-PIPELINE.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - name: IMAGE_DIGEST
+              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
           # Container level security context. The pod level one above cannot
           # express these, because they are properties of the container.

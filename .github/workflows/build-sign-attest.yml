@@ -1,0 +1,639 @@
+---
+##############################################################################
+# build-sign-attest
+#
+# Chapter 3. The pipeline that lets the cluster refuse everything else.
+#
+# THE CLAIM THIS WORKFLOW EXISTS TO BACK UP:
+#
+#   The cluster will not run an image unless it can prove that THIS repository's
+#   pipeline built it, from THIS repository's source, and that nobody has touched
+#   the bytes since.
+#
+# Signing is the easy half. The half that matters is the gate, and the gate is in
+# policies/. This file produces the evidence the gate checks.
+#
+# THREE JOBS, THREE DIFFERENT SETS OF PERMISSIONS.
+#
+#   gate    scans. Runs on every pull request. Holds NO cloud credential at all.
+#   build   builds, pushes, signs, attests. Runs only on main.
+#   deploy  writes the digest into Git. Holds contents:write and nothing else.
+#
+# Splitting them is not tidiness. A pull request run receives an OIDC subject
+# claim of the shape `repo:owner/name:pull_request`, and the IAM trust policy in
+# terraform/modules/github_oidc only accepts `repo:owner/name:ref:refs/heads/main`.
+# So a pull request CANNOT obtain AWS credentials. That is enforced by the shape
+# of the claim rather than by an `if` in this file, which is the stronger place
+# to enforce it: an `if` can be edited in the same pull request it is meant to
+# constrain.
+#
+# EVERY ACTION IS PINNED TO A FULL COMMIT SHA.
+#
+# `actions/checkout@v4` is a mutable tag. A tag is a pointer, and pointers move.
+# A supply chain security pipeline that trusts mutable tags for its own
+# dependencies is arguing against itself, and it is the first thing anyone
+# reading this file should check. The version number is in the trailing comment
+# so the pin is still readable; the SHA is what is enforced.
+#
+# WHAT NEEDS TO BE CONFIGURED, ONCE
+#
+#   Repository variable AWS_ROLE_ARN   `make ci-config` prints it after
+#                                      `make apply ENV=ci`
+#   Repository variable AWS_REGION     optional, defaults to eu-west-2
+#
+# There is no repository SECRET. There is no AWS access key. That is the point.
+##############################################################################
+
+name: build-sign-attest
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      # THE LOOP GUARD.
+      #
+      # The deploy job below commits the new image digest into
+      # platform/manifests/. Without this, that commit triggers another build,
+      # which produces another digest, which triggers another build.
+      #
+      # GitHub already declines to trigger workflows from a push made with
+      # GITHUB_TOKEN, so this is the second of two independent guards. Two,
+      # because the first one stops working silently the day someone swaps
+      # GITHUB_TOKEN for a personal access token or a GitHub App token to get
+      # past branch protection.
+      - 'platform/manifests/**'
+      - 'docs/**'
+      - 'evidence/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Deny by default, then grant per job. The workflow level default in GitHub is
+# to hand every job a broad token; setting it to {} here means a job that
+# forgets to declare what it needs gets nothing rather than everything.
+permissions: {}
+
+concurrency:
+  # Two merges landing close together would otherwise race to rewrite the same
+  # line of deployment.yaml, and the loser would quietly overwrite the winner.
+  #
+  # cancel-in-progress is FALSE on purpose. Cancelling a half finished run could
+  # leave an image pushed and signed but never recorded in Git, which is
+  # confusing rather than dangerous, and the queue here is never long.
+  group: build-sign-attest-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
+
+  # The repository name inside ECR. The registry host is not written here: it
+  # embeds the AWS account ID and is discovered at run time from the ECR login
+  # step, so this file needs no account specific configuration.
+  ECR_REPOSITORY_NAME: secure-delivery-ci/app
+
+  # Matches app_tag_prefixes in terraform/environments/ci/main.tf. If you change
+  # one, change the other, or the ECR lifecycle policy stops counting your
+  # application images and the catch-all rule takes over.
+  IMAGE_TAG_PREFIX: sha-
+
+jobs:
+  ##########################################################################
+  # JOB 1: gate
+  #
+  # Runs on every pull request and every push. Holds no cloud credential.
+  # Nothing downstream runs if this fails, so a leaked secret never reaches a
+  # build, let alone a registry.
+  ##########################################################################
+  gate:
+    name: Secret and vulnerability gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout, with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # fetch-depth: 0 IS LOAD BEARING.
+          #
+          # The default is a shallow clone of one commit. Gitleaks would then
+          # scan that single commit, find nothing, and report success. A secret
+          # committed last March and removed in April is still in the history and
+          # still valid; the whole reason to scan history rather than the working
+          # tree is that `git rm` does not unpublish anything.
+          fetch-depth: 0
+
+      - name: Install gitleaks, verifying the download
+        env:
+          # Pinned, and the checksum is checked. The upstream gitleaks binary is
+          # used directly rather than the marketplace action, for two reasons:
+          # the action is proprietary and requires a licence key for
+          # organisation owned repositories, and running the binary means one
+          # fewer piece of third party JavaScript executing with access to this
+          # job's token.
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 -o gitleaks.tar.gz "$url"
+          # Verifying the checksum of your secret scanner is not paranoia in a
+          # chapter about verifying artefacts. It would be odd not to.
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks gitleaks.tar.gz
+          gitleaks version
+
+      - name: Gitleaks secret scan over the whole history
+        run: |
+          set -euo pipefail
+          # --redact so a finding does not print the secret into a public build
+          # log, which would publish it far more effectively than the commit did.
+          # --log-opts=--all covers every ref, not just the checked out branch.
+          gitleaks git . \
+            --redact \
+            --verbose \
+            --exit-code 1 \
+            --log-opts="--all --full-history"
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          # vuln reads go.sum and reports known CVEs in dependencies.
+          # secret is a second, differently implemented opinion alongside
+          # gitleaks. They disagree often enough to be worth running both, which
+          # is the same argument docs/architecture.md section 11 makes for
+          # running Checkov and Trivy over the Terraform.
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          # STRICT HERE, deliberately. Unlike the image scan below, this one does
+          # not pass --ignore-unfixed: a vulnerable dependency with no upstream
+          # fix is still a decision someone should make consciously, and the
+          # place to record that decision is .trivyignore.yaml, which is the
+          # accepted risk register this project already keeps.
+          trivyignores: .trivyignore.yaml
+
+  ##########################################################################
+  # JOB 2: build
+  #
+  # Builds, pushes, scans, attests and signs. This is the only job that ever
+  # holds an AWS credential, and that credential is a one hour STS session
+  # obtained by proving identity, not a stored key.
+  ##########################################################################
+  build:
+    name: Build, sign and attest
+    needs: gate
+    # Belt to the trust policy's braces. Even if this condition were removed, a
+    # pull request run could not assume the AWS role.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      # The OIDC token. Used TWICE and for two different purposes, which is the
+      # neat part of this design:
+      #   1. exchanged with AWS STS for temporary credentials
+      #   2. presented to Fulcio to obtain a ten minute signing certificate
+      # The same proof of identity replaces both a stored cloud key and a stored
+      # signing key.
+      id-token: write
+      contents: read
+      # Required by actions/attest-build-provenance to record the attestation
+      # against the repository.
+      attestations: write
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      image_ref: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      ####################################################################
+      # STEP 2 of the chapter brief: authenticate to AWS with no stored key.
+      ####################################################################
+      - name: Assume the AWS role via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          # There is no AWS_ACCESS_KEY_ID and no AWS_SECRET_ACCESS_KEY, here or
+          # in repository secrets. GitHub mints a short lived OIDC token
+          # asserting which repository, which branch and which workflow is
+          # running; AWS validates it against the registered identity provider
+          # and hands back a one hour session.
+          #
+          # This is exactly the mechanism chapter 1 used between the EKS cluster
+          # and IAM, pointed at GitHub instead. See docs/architecture.md
+          # section 8, then section 25.
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Appears in CloudTrail, so an ECR push can be traced back to the exact
+          # workflow run that made it without correlating timestamps by hand.
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2.1.6
+
+      - name: Work out the image reference
+        id: meta
+        run: |
+          set -euo pipefail
+          registry="${{ steps.ecr.outputs.registry }}"
+          image="${registry}/${ECR_REPOSITORY_NAME}"
+          # Twelve characters rather than seven. Seven character abbreviations
+          # already collide in large repositories, and a tag that collides in an
+          # IMMUTABLE registry is a push that fails at three in the morning.
+          tag="${IMAGE_TAG_PREFIX}$(git rev-parse --short=12 HEAD)"
+          # Linked into the binary and reported at /version. It also means a
+          # re-run of this workflow on the same commit produces different bytes
+          # and therefore a different digest, which happens to sidestep the one
+          # case where cosign would need to update an existing signature tag.
+          # Convenient rather than designed, and noted so it is not mistaken for
+          # a guarantee.
+          built="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          {
+            echo "image=${image}"
+            echo "tag=${tag}"
+            echo "built=${built}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${image}:${tag}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      ####################################################################
+      # STEP 3: build, push, and capture the DIGEST.
+      #
+      # The digest is the only identifier used from this point on. The tag
+      # exists so a human can find the image in the console; nothing in the
+      # signing, attestation, verification or deployment path ever refers to
+      # it. See docs/architecture.md section 24 for why that distinction is
+      # the whole chapter.
+      ####################################################################
+      - name: Build and push to ECR
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: app/src
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          # One platform, so the push produces a single image manifest with a
+          # single digest. A multi platform build produces an image INDEX whose
+          # digest covers several manifests, and signing an index rather than an
+          # image is a subtly different thing that admission policies handle
+          # inconsistently. One architecture is what this project needs, so the
+          # complication is avoided rather than managed.
+          platforms: linux/amd64
+
+          # BuildKit's own inline provenance and SBOM attestations are turned
+          # OFF, and this is not a step backwards.
+          #
+          # When they are on, BuildKit wraps the image in an index containing the
+          # image plus attestation manifests, which changes the digest that gets
+          # pushed and reintroduces the index problem above. This workflow
+          # generates its own SBOM with syft and its own provenance with the
+          # GitHub attestation action, both of which attach to the image by
+          # digest and are verifiable by Kyverno. Two sources of attestation
+          # would be one more than anyone can reason about.
+          provenance: false
+          sbom: false
+
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.built }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      ####################################################################
+      # STEP 4: scan what was actually pushed, by digest.
+      #
+      # THE OBVIOUS OBJECTION: you pushed before you scanned, so a vulnerable
+      # image now exists in the registry.
+      #
+      # True, and accepted. Building into the local daemon and pushing
+      # afterwards does not compose cleanly with attestations, and the
+      # mitigation is complete rather than partial: if this step fails, the job
+      # fails, the digest is never written into platform/manifests/, and
+      # nothing deploys it. The image sits in ECR referenced by nothing and is
+      # expired by the lifecycle policy. An unreferenced image in a private
+      # registry is not a running workload.
+      ####################################################################
+      - name: Trivy scan of the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          # --ignore-unfixed, unlike the filesystem scan.
+          #
+          # A finding with no upstream patch cannot be acted on by this pipeline.
+          # Failing every build on it does not make the image safer; it makes the
+          # gate something people learn to bypass, and a control everyone routes
+          # around is worse than no control because it still reports green.
+          #
+          # The honest cost: an unfixed CRITICAL in the base image will not stop
+          # a deployment. The compensating controls are the distroless base,
+          # which has almost no packages to be vulnerable, and the fact that this
+          # is recorded here rather than discovered.
+          ignore-unfixed: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      ####################################################################
+      # STEP 5: SBOM, attached as a signed attestation.
+      #
+      # An SBOM in a build artifact is a file nobody reads. An SBOM attached to
+      # the image as a signed attestation is a claim that travels with the
+      # artefact and can be verified by whoever ends up running it. When the
+      # next log4j happens, the question "are we affected" becomes a query
+      # against the registry rather than an investigation.
+      ####################################################################
+      - name: Generate the CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attach the SBOM as a cosign attestation
+        env:
+          COSIGN_YES: 'true'
+          IMAGE_REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Keyless. No --key argument, because there is no key. cosign generates
+          # an ephemeral keypair in memory, presents this job's OIDC token to
+          # Fulcio, receives a ten minute certificate binding the public key to
+          # this workflow's identity, signs, records the event in Rekor, and
+          # discards the private key. See docs/architecture.md section 25.
+          cosign attest \
+            --type cyclonedx \
+            --predicate sbom.cdx.json \
+            "${IMAGE_REF}"
+
+      ####################################################################
+      # STEP 6: sign the image itself, by digest.
+      ####################################################################
+      - name: Cosign keyless signature
+        env:
+          COSIGN_YES: 'true'
+          IMAGE_REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # BY DIGEST. Never by tag.
+          #
+          # Signing a tag signs a NAME. Tomorrow that name can point at different
+          # bytes and the verification of the name still passes, so the signature
+          # answers a question nobody asked. Chapter 2 demonstrated the same
+          # class of bug without an attacker: rebuilding under the tag 0.1.0 left
+          # the manifest unchanged, so the cluster changed nothing and the pods
+          # kept serving the old binary while reporting Synced and Healthy.
+          #
+          # A digest cannot be repointed, because it IS the content.
+          cosign sign "${IMAGE_REF}"
+
+      ####################################################################
+      # STEP 7: SLSA build provenance.
+      #
+      # The signature says WHO built it. The provenance says WHAT was built and
+      # FROM WHERE: repository, commit, workflow, runner, timestamp, in a
+      # structured format a policy can read rather than a human.
+      #
+      # It is generated by the build platform rather than by this file, which
+      # is the property that makes it worth anything. A provenance document a
+      # workflow writes about itself is a self assessment.
+      #
+      # Because this repository is PUBLIC, GitHub signs the attestation with the
+      # public good Sigstore instance, so it lands in the public Rekor
+      # transparency log and can be verified by anyone, with no GitHub
+      # credential. A private repository would use GitHub's internal Fulcio
+      # instead, and the Kyverno policy would need to trust that instead.
+      ####################################################################
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          # Stores the attestation alongside the image in ECR as well as in
+          # GitHub's attestation store. Kyverno reads it from the registry: the
+          # cluster has no GitHub credential and, per chapter 2, is never given
+          # one.
+          push-to-registry: true
+
+      ####################################################################
+      # VERIFY OUR OWN WORK BEFORE ANYTHING DEPENDS ON IT.
+      #
+      # This step is not ceremony. Without it, a mismatch between what the
+      # pipeline signs and what the cluster expects surfaces as pods that will
+      # not start, at ArgoCD sync time, with an error about signatures that
+      # points at the cluster rather than at the pipeline. Failing here instead
+      # turns a confusing production symptom into an obvious build failure.
+      #
+      # The identity is reconstructed from GitHub context rather than pasted, so
+      # this check cannot drift from reality. It CAN drift from the Kyverno
+      # policy, which is why the same string is a Terraform output.
+      ####################################################################
+      - name: Verify the signature and attestations we just made
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/build-sign-attest.yml@${GITHUB_REF}"
+          issuer="https://token.actions.githubusercontent.com"
+
+          echo "::group::Expected signing identity"
+          echo "  identity: ${identity}"
+          echo "  issuer:   ${issuer}"
+          echo "  image:    ${IMAGE_REF}"
+          echo "::endgroup::"
+
+          echo "==> Verifying the image signature"
+          cosign verify \
+            --certificate-identity="${identity}" \
+            --certificate-oidc-issuer="${issuer}" \
+            "${IMAGE_REF}" > /dev/null
+
+          echo "==> Verifying the SBOM attestation"
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity="${identity}" \
+            --certificate-oidc-issuer="${issuer}" \
+            "${IMAGE_REF}" > /dev/null
+
+          echo "==> Verifying the SLSA build provenance"
+          gh attestation verify "oci://${IMAGE_REF}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/build-sign-attest.yml"
+
+          echo "All three verified against the identity the cluster will require."
+
+      - name: Summary
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Signed image"
+            echo
+            echo '```'
+            echo "${IMAGE_REF}"
+            echo '```'
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`${{ steps.meta.outputs.tag }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| signed by | \`${GITHUB_WORKFLOW_REF}\` |"
+            echo
+            echo "Deployed by digest. The tag is for humans and is referenced by nothing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ##########################################################################
+  # JOB 3: deploy
+  #
+  # Writes the digest into Git. That is the entire job.
+  #
+  # NOTE WHAT IS ABSENT. There is no kubectl, no kubeconfig, no cluster
+  # endpoint and no inbound path to any cluster. Chapter 2's argument still
+  # holds in full: the pipeline does not deploy, it commits, and the cluster
+  # pulls. See docs/architecture.md section 17.
+  #
+  # The honest concession, which chapter 2 already made in rebuttal 4: this job
+  # holds write access to the default branch. Git write is far less privileged
+  # than cluster write, it is auditable in commit history, and it is
+  # constrainable with branch protection. Downgrading a credential is a real
+  # win even when it cannot be deleted.
+  ##########################################################################
+  deploy:
+    name: Record the digest in Git
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      # The narrowest set that can do the job. No id-token, no packages, no
+      # attestations. This job cannot reach AWS at all.
+      contents: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          # A shallow clone cannot be rebased onto a moved main, which is what
+          # the retry loop below does when two merges land close together.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Rewrite the deployment to the new digest
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          command -v yq >/dev/null || {
+            echo "yq is not on this runner image"; exit 1; }
+
+          manifest=platform/manifests/demo-app/deployment.yaml
+          ref="${IMAGE}@${DIGEST}"
+
+          # Three fields, and all three matter.
+          #
+          #   image        what the kubelet pulls. A digest, so it pulls exactly
+          #                the bytes that were signed and verified.
+          #   IMAGE_REF    reported at /version.
+          #   IMAGE_DIGEST reported at /version. Chapter 2 shipped this endpoint
+          #                already reporting "unset", with a comment saying
+          #                chapter 3 would fill it in. This is that line.
+          yq -i "
+            (.spec.template.spec.containers[] | select(.name == \"demo-app\") | .image) = \"${ref}\" |
+            (.spec.template.spec.containers[] | select(.name == \"demo-app\") | .env[] | select(.name == \"IMAGE_REF\")    | .value) = \"${ref}\" |
+            (.spec.template.spec.containers[] | select(.name == \"demo-app\") | .env[] | select(.name == \"IMAGE_DIGEST\") | .value) = \"${DIGEST}\"
+          " "$manifest"
+
+          echo "::group::Resulting image reference"
+          yq '.spec.template.spec.containers[0].image' "$manifest"
+          echo "::endgroup::"
+
+          # Sanity check. A tag reference here would silently undo the entire
+          # chapter, so it fails loudly instead.
+          grep -q "@sha256:" "$manifest" || {
+            echo "deployment.yaml does not reference an image by digest. Refusing to commit."
+            exit 1
+          }
+
+      - name: Commit and push
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- platform/manifests/; then
+            echo "Digest unchanged. Nothing to commit."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The body is built with printf rather than a heredoc, because a
+          # heredoc inside an indented YAML block needs its terminator at column
+          # zero and is a reliable way to produce a shell error that reads like a
+          # YAML error.
+          body=$(printf '%s\n' \
+            "image:  ${IMAGE}@${DIGEST}" \
+            "source: ${GITHUB_SHA}" \
+            "run:    ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "" \
+            "Deployed by digest, never by tag. ArgoCD picks this up on its next" \
+            "reconciliation and Kyverno verifies the signature at admission.")
+
+          git add platform/manifests/demo-app/deployment.yaml
+          git commit --message "deploy: demo-app ${TAG}" --message "${body}"
+
+          # Rebase and retry, because concurrency groups serialise runs on the
+          # same ref but not merges arriving between them.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected, rebasing onto main and retrying."
+            git pull --rebase origin main
+          done
+
+          echo "Could not push after three attempts."
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### Committed to main"
+            echo
+            echo "ArgoCD reconciles every 30 seconds, so the new digest reaches"
+            echo "the cluster shortly. Kyverno verifies the signature at"
+            echo "admission before a single pod is scheduled."
+            echo
+            echo "    make argocd-status"
+          } >> "$GITHUB_STEP_SUMMARY"

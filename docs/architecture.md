@@ -1,12 +1,14 @@
 # Architecture
 
-Chapters 1 and 2 of the secure-delivery-platform. This document explains **why**
-the infrastructure is shaped the way it is. The code explains what it does; this
-explains what it is for.
+The secure-delivery-platform. This document explains **why** the infrastructure
+is shaped the way it is. The code explains what it does; this explains what it
+is for.
 
 Sections 1 to 15 cover chapter 1, the AWS foundations. Sections 16 to 22 cover
 chapter 2, GitOps delivery with ArgoCD, which runs entirely on the local kind
-cluster and costs nothing.
+cluster and costs nothing. Sections 23 to 30 cover chapter 3, supply chain
+security: the build pipeline, keyless signing, and the admission policy that
+rejects everything it cannot verify.
 
 ---
 
@@ -303,8 +305,9 @@ rather than encrypted, is visible to anyone with read access to the namespace,
 and is the single most common way cloud credentials leak.
 
 The OIDC provider means the project's rule of *no hardcoded secrets, no access
-keys anywhere* is structurally enforced rather than a matter of discipline. In
-chapter 3, the signing and verification components will use it.
+keys anywhere* is structurally enforced rather than a matter of discipline.
+Chapter 3 applies the identical mechanism to GitHub Actions, so the build
+pipeline holds no AWS key either. Section 29 is that trust policy line by line.
 
 The same mechanism explains why nodes carry
 `AmazonEC2ContainerRegistryReadOnly`: the kubelet pulls from ECR using the node's
@@ -381,9 +384,13 @@ demonstrates production sizing without paying about $185/month for an idle
 cluster.
 
 `make apply ENV=prod` and `make destroy ENV=prod` refuse to run, enforced in the
-Makefile rather than left to discipline. In chapter 3 a CI check runs
-`terraform plan` against prod on every pull request, at which point prod stops
-being dead code and becomes a continuously verified specification.
+Makefile rather than left to discipline.
+[.github/workflows/terraform-plan.yml](../.github/workflows/terraform-plan.yml),
+added in chapter 3, runs `terraform plan` against prod on every pull request, so
+prod is no longer dead code but a continuously verified specification. It assumes
+a **read only** role, separate from the one the build pipeline uses, and runs
+with `-lock=false` because a genuinely read only role cannot write the state
+lock. Section 29.
 
 ---
 
@@ -408,8 +415,26 @@ written reason:
   which doubles as a single short accepted risk register that can be read on its
   own.
 
-Current state: **114 Checkov checks pass, 0 fail, 25 are suppressed with written
-reasons. Trivy config and secret scans are clean.**
+Current state after chapter 3: **164 Checkov checks pass, 0 fail, 28 are
+suppressed with written reasons. Trivy config and secret scans are clean.**
+
+**One of those checks earned its keep during chapter 3.** The read only IAM role
+used by the terraform plan workflow originally granted `ec2:Get*`. Checkov failed
+it under CKV_AWS_107, credentials exposure, because that wildcard expands to
+include `ec2:GetPasswordData`, which returns the encrypted administrator password
+of a Windows instance. It was granted to a role that anyone opening a pull
+request can assume, in a policy whose entire purpose was to be read only.
+
+It was also not needed, so it was removed rather than suppressed. That is the
+outcome this gate exists for, and it is a more useful thing to be able to say
+than a clean first draft. The reasoning is left as a comment at the point where
+the action used to be, so the absence reads as a decision.
+
+The reverse also happened. Two suppressions written in the first draft, arguing
+that the wildcard on `ecr:GetAuthorizationToken` was unavoidable, turned out to
+suppress nothing: Checkov does not flag it, because AWS offers no way to scope
+that action and the scanner knows it. Both were deleted. **A suppression that
+suppresses nothing is noise pretending to be diligence.**
 
 The suppressions fall into three groups:
 
@@ -419,7 +444,9 @@ The suppressions fall into three groups:
 2. **Scanner limitations.** `CKV_AWS_38` flags the EKS public endpoint because
    Checkov cannot resolve `var.public_access_cidrs` at scan time and assumes the
    worst case. The variable's validation rule makes `0.0.0.0/0` impossible to
-   configure.
+   configure. `AVD-AWS-0031` flags the ci registry as not immutable because Trivy
+   does not yet recognise `IMMUTABLE_WITH_EXCLUSION`, which AWS added in July
+   2025. Section 26 argues why that setting is not the retreat it looks like.
 3. **One genuine risk acceptance**, the public API endpoint, argued in full in
    section 6.
 
@@ -955,11 +982,16 @@ Four endpoints:
 | `/version` | Provenance: the commit the binary was built from, the build time, and a SHA256 the binary computes **of itself** at runtime by reading `/proc/self/exe`. |
 | `/metrics` | Prometheus exposition: custom request counters and histograms, plus the standard Go runtime and process collectors. Nothing scrapes it yet. It exists so chapter 5 is a matter of installing Prometheus rather than editing every workload. |
 
-`/version` is the one that matters later. Today it reports `image_digest` as
-explicitly unset, because the image is side-loaded rather than pulled by digest.
-In chapter 3 the Deployment sets `IMAGE_DIGEST` to the digest that was actually
-signed and verified at admission, and this endpoint becomes the visible proof
-that what is running is what was verified. The self-computed `binary_sha256` is
+`/version` is the one that matters later. **In chapter 2** it reported
+`image_digest` as explicitly unset, because the image was side-loaded rather than
+pulled by digest. **Chapter 3 fills it in**: the pipeline writes `IMAGE_DIGEST`
+into the Deployment alongside the image reference, so the endpoint reports the
+digest that was signed and verified at admission.
+
+Read section 28, limit 18, before treating that as proof. These are environment
+variables, and a pod that lies about its own provenance is trivial to construct.
+They are meaningful because of what surrounds them, not because the application
+says so. The self-computed `binary_sha256` is
 the one provenance claim the application can make without trusting anything else
 to have set an environment variable honestly.
 
@@ -978,12 +1010,15 @@ So: **the manifests are in Git and provably so. The image bytes are not. They
 came from a laptop and nothing verifies them.**
 
 That is a hole in this chapter's own premise, and it is written here rather than
-left to be discovered. Chapter 3 closes it exactly: a build pipeline that
-produces the image, a signature over it, and an admission policy that refuses to
-run anything unsigned. The chapter 1 pieces that make it possible are already in
-place, the IAM OIDC provider and immutable ECR tags.
+left to be discovered.
 
-Naming the gap is what makes chapter 3 a plan rather than an afterthought.
+**Chapter 3 closes it exactly as described**, and section 23 onwards is that
+work: a build pipeline that produces the image, a keyless signature over its
+digest, SLSA build provenance, and two admission policies that refuse anything
+they cannot verify. The chapter 1 pieces that made it possible were already in
+place, the OIDC mechanism and immutable ECR tags.
+
+Naming the gap is what made chapter 3 a plan rather than an afterthought.
 
 ---
 
@@ -1043,9 +1078,12 @@ Written down deliberately, because an unlisted gap looks like an oversight and a
 listed one looks like a roadmap.
 
 - **The image is not from Git and not verified.** The largest gap. Section 20.
+  **Closed in chapter 3**, sections 23 to 30.
 - **ArgoCD is not scoped.** It runs with broad cluster rights and no ArgoCD
   Project restricting destinations or resource kinds. This is the first thing to
-  fix on a shared cluster.
+  fix on a shared cluster. **Still open**, and it matters more from chapter 3
+  onwards, because the same mechanism that delivers the admission policies could
+  be used to delete them.
 - **`targetRevision: main`**, so any merge to main reaches the cluster within one
   reconciliation interval. Correct for one cluster and one operator; a real
   promotion pipeline pins a tag or a per environment branch.
@@ -1061,6 +1099,625 @@ listed one looks like a roadmap.
   the right answer for a real cluster and is a second thing to explain.
 - **No sync waves or custom health checks.** Not needed for one app with no
   ordering dependencies. Needed the moment something ships CRDs that another app
-  depends on.
+  depends on. **That moment arrived in chapter 3**, when Kyverno's
+  CustomResourceDefinitions had to exist before the policies that use them. Waves
+  are now -2 for the engine, -1 for the policies and 0 for the workload.
 - **`server.insecure: true`.** Section 19.
 - **kind runs Kubernetes 1.34 while EKS runs 1.35.** Section 13.
+
+---
+
+# Chapter 3: supply chain security
+
+The AWS footprint of this chapter is an ECR repository, an IAM identity provider
+and two IAM roles. That is roughly a penny a month and no cluster at all.
+Everything else, including both admission policies and the demonstration that
+they work, runs on the free local kind cluster.
+
+---
+
+## 23. What chapter 3 claims, and the gap it closes
+
+Section 20 named the hole in chapter 2 in plain terms:
+
+> The manifests are in Git and provably so. The image bytes are not. They came
+> from a laptop and nothing verifies them.
+
+Chapter 3 closes it, and the claim it makes is this:
+
+> **The cluster will not run an image unless it can prove that this repository's
+> pipeline built it, from this repository's source, and that nobody has touched
+> the bytes since.**
+
+Note the shape of that sentence. It is not "we sign our images". Signing is the
+easy half and on its own it proves nothing, because nothing checks. The half that
+matters is the **gate**: an admission controller that rejects an image whose
+provenance cannot be established, that you can watch reject a real image, with
+the reason on screen.
+
+The terms, defined once.
+
+| Term | Meaning |
+|---|---|
+| **Supply chain** | Everything between someone typing code and a process running it: source, dependencies, build machine, registry, cluster. Every step is somewhere an attacker can substitute bytes. |
+| **Digest** | The SHA256 hash of an image's manifest, written `sha256:abc...`. Computed from the content, so it **is** the content's name. |
+| **Tag** | A human friendly label pointing at a digest, like `:0.1.0`. A pointer, not an identity. |
+| **Signature** | A cryptographic statement that the holder of a key vouched for a specific digest. |
+| **Attestation** | A signed statement **about** an artefact rather than merely over it. Same machinery, structured payload. |
+| **SBOM** | Software Bill of Materials. A machine readable inventory of everything in an image. |
+| **CycloneDX** | One of the two standard SBOM formats. The other is SPDX. |
+| **Syft** | The tool that reads an image and produces the SBOM. |
+| **Provenance** | A signed record of *how* an artefact was built: repository, commit, workflow, builder, time. |
+| **SLSA** | "Supply chain Levels for Software Artefacts", pronounced salsa. Grades how trustworthy a build process is. |
+| **Cosign** | The signing and verification tool from the Sigstore project. |
+| **Fulcio** | A certificate authority issuing ten minute signing certificates in exchange for a proven identity. Section 25. |
+| **Rekor** | The transparency log. An append only, publicly auditable ledger of signing events. Section 25. |
+| **OIDC** | OpenID Connect. One system issues a short lived signed token asserting who the bearer is; another is configured to trust that issuer. Chapter 1 already used it between EKS and IAM. |
+| **Admission controller** | Code in the API server's request path that can accept, modify or reject an object **before** it is written to etcd. |
+| **Kyverno** | A policy engine that runs as an admission controller, with policies written as Kubernetes resources rather than as code. |
+
+The three things chapter 1 built that this chapter genuinely could not work
+without, exactly as predicted in section 1: **the OIDC mechanism**, so nothing
+holds an access key; **immutable ECR tags**, so a verified signature stays
+meaningful; and **the `/version` endpoint** from chapter 2, which has been
+reporting `image_digest` as explicitly unset since the day it shipped and now
+reports the digest that was signed and verified.
+
+---
+
+## 24. Signing by tag against signing by digest
+
+This is the most important idea in the chapter, and it is worth being precise
+about because it already caused a real incident in chapter 2.
+
+### The chapter 2 incident, which needed no attacker
+
+The demo image was rebuilt under the same `0.1.0` tag. The Deployment manifest
+still said `image: demo-app:0.1.0`, byte for byte identical to what was already
+applied. Kubernetes compared the pod template, found no change, and correctly did
+nothing. The running pods kept serving the old binary.
+
+Nothing failed. Nothing logged an error. ArgoCD reported `Synced` and `Healthy`
+throughout, and it was right on both counts: the cluster genuinely did match Git.
+The system was correct and the deployment was a lie.
+
+That is the whole problem in miniature, and it did not require a malicious actor,
+a compromised registry or a clever attack. It required a rebuild.
+
+### The same bug with an attacker attached
+
+1. The pipeline builds good bytes, tags them `:1.4.2`, and signs the tag.
+2. An attacker with registry push access repoints `:1.4.2` at their own bytes.
+3. Admission verifies the signature on `:1.4.2`. It passes. The malicious image
+   runs.
+
+At no point in that sequence is a signature broken or a check skipped. The
+signature verified precisely what it was asked to verify: **a name**. Nobody
+asked about the bytes.
+
+A tag is a mutable pointer. Signing one produces a statement of the form "a label
+called 1.4.2 was blessed at some point", which is not a useful thing to know.
+
+### Why the digest fixes it
+
+A digest is the SHA256 of the image manifest. It is derived from the content, so
+it is not a label attached to the content, it **is** the content's name. Change
+one byte and you have a different digest, and therefore a different artefact with
+a different name. There is no pointer to move.
+
+### Both halves are needed, and they are separate requirements
+
+**The policy must verify by digest.** Kyverno's `verifyImages` rule sets
+`verifyDigest: true` and `mutateDigest: true`. If a pod arrives referencing a
+tag, Kyverno resolves that tag, verifies those bytes, and then **rewrites the pod
+spec** to the digest it resolved. Without the rewrite there is a window between
+"Kyverno resolved the tag and verified those bytes" and "the kubelet resolved the
+same tag and pulled whatever it pointed at by then". That is a time of check to
+time of use gap, and mutating the spec closes it.
+
+**The manifest must reference a digest.** This is what
+[platform/manifests/demo-app/deployment.yaml](../platform/manifests/demo-app/deployment.yaml)
+now does, written by the pipeline. It matters for three reasons beyond
+verification:
+
+- ArgoCD's diff becomes meaningful. A new build changes the manifest, so a
+  rollout actually happens. The chapter 2 incident becomes impossible.
+- Git records exactly what is running. `git log` on that one line is a deployment
+  history.
+- The kubelet pulls exactly the bytes that were verified, with no second
+  resolution step in between.
+
+Chapter 1's immutable ECR tags are the third layer. They mean a tag cannot be
+repointed at all, so the attack above fails at step 2 rather than at step 3. But
+immutability is a registry setting somebody can change, and it only holds inside
+one registry. Deploying by digest holds regardless of the registry. Neither is
+trusted alone, which is the same reasoning the Dockerfile gives for stating
+`USER 65532` explicitly rather than relying on the `:nonroot` base tag.
+
+---
+
+## 25. Keyless signing, and what the transparency log is for
+
+### The problem with keys
+
+The traditional model is: generate a keypair, keep the private key secret
+forever, publish the public key. The difficulty is the word *forever*. The key
+has to be reachable by a build machine, which means a CI secret, a KMS key or an
+HSM.
+
+A CI secret is a long lived credential. Chapters 1 and 2 spent their entire
+effort deleting exactly those. Reintroducing one in order to prove a point about
+supply chain security would be self defeating.
+
+### What replaces the private key
+
+**Keyless signing does not remove the key. It removes the key's lifetime.**
+
+1. Cosign generates a keypair **in memory** on the runner. It has never existed
+   before and will never exist again.
+2. GitHub Actions issues an OIDC token asserting the identity of the running job.
+   Not "clinton" and not "a runner", but this exact string:
+
+   ```text
+   https://github.com/clintonsenaye/secure-delivery-platform/.github/workflows/build-sign-attest.yml@refs/heads/main
+   ```
+
+3. Cosign sends the ephemeral **public** key and that token to **Fulcio**. Fulcio
+   validates the token against GitHub's published keys and issues an X.509
+   certificate binding the public key to that identity. **The certificate is
+   valid for ten minutes.**
+4. Cosign signs the image digest with the ephemeral private key.
+5. Cosign records the signature, the certificate and the digest in **Rekor**.
+6. **The private key is discarded.** It never touched disk and never left the
+   runner's memory.
+
+What replaces the private key is **an identity plus a timestamp**. Verification
+does not ask "is this the right key". It asks "was this signed by a certificate
+Fulcio issued to *this workflow*, while that certificate was valid".
+
+There is nothing to store, rotate, revoke or leak. The signing key existed for
+under ten minutes and does not exist anywhere now.
+
+The parallel with the rest of the project is exact and worth drawing out loud.
+The IAM OIDC provider replaced a stored AWS access key with a proof of identity.
+GitOps replaced a stored cluster credential with a direction of travel. Keyless
+signing replaces a stored signing key with a proof of identity. **All three
+replace a secret with something that cannot be copied.**
+
+### What Rekor is actually for
+
+The signing certificate expired ten minutes after it was issued. Verification
+happens weeks later. So how does a verifier know the signature was made while the
+certificate was valid, rather than afterwards by whoever obtained the key?
+
+**That is Rekor's primary job, and it is more prosaic than the name suggests.**
+Rekor is an append only log with a Merkle tree structure, so retroactive edits
+are detectable. When Cosign signs, it submits the event and Rekor returns a
+**signed timestamp** proving the entry existed at that moment. At verification
+time, Cosign fetches the Rekor entry and checks the signing timestamp falls
+inside the certificate's ten minute window.
+
+Without Rekor, a ten minute certificate would be useless for verifying anything
+older than ten minutes.
+
+The secondary job is the one the word transparency advertises:
+
+- **Detection, not prevention.** If Fulcio were compromised and issued a
+  certificate impersonating this workflow, that would not be prevented. But the
+  fraudulent signature has to appear in a public, append only log, so it can be
+  found. This is exactly the design of Certificate Transparency for TLS, and for
+  the same reason: you cannot stop a certificate authority lying, but you can
+  stop it lying *quietly*.
+- **A public history.** Anyone can audit what has ever been signed as this
+  project, without asking this project.
+
+The honest caveats. This uses the **public good** Sigstore instance, run for free
+by the Linux Foundation, so every signature and every identity string is public.
+There is nothing sensitive in that here. Verification also depends on Rekor being
+reachable, which is an availability dependency on a third party, discussed in
+section 28. And **nothing in this project monitors Rekor**. The detection
+mechanism exists and nobody is watching it, which is listed as a gap in section
+30 rather than glossed over.
+
+---
+
+## 26. The registry, and two ways it quietly breaks signing
+
+Chapter 1 set `image_tag_mutability = "IMMUTABLE"` and section 9 argued at length
+that this was one of the two load bearing decisions in the chapter. Chapter 3
+then discovers that the same setting breaks Cosign, and that the ECR lifecycle
+policy will eventually delete your signatures. Both are worth knowing before they
+happen, because both fail in confusing ways.
+
+### One: Cosign stores signatures as tags
+
+Cosign does not push a signature as a distinct kind of object. It pushes it to
+the same repository under a **derived tag**. An image with digest `sha256:abc...`
+gets its signature at `sha256-abc....sig` and its attestations at
+`sha256-abc....att`.
+
+Attaching a second attestation to an image means **updating an existing tag**,
+which a fully immutable repository refuses. Signing appears to work and then
+fails on the second attestation, with a registry error about immutability that
+looks like a permissions problem.
+
+The tempting fix is to set the repository to `MUTABLE`, which discards the
+guarantee section 9 called load bearing. This project takes the narrow fix
+instead. AWS added `IMMUTABLE_WITH_EXCLUSION` in July 2025:
+
+```hcl
+image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
+image_tag_mutability_exclusion_filters = ["sha256-*"]
+```
+
+Application tags stay immutable. Only the `sha256-*` namespace becomes writable.
+
+**Why that exclusion is safe rather than merely convenient.** A Cosign metadata
+tag is derived from the digest of the thing it describes, so it is already
+content addressed. Overwriting `sha256-abc....sig` can only change the metadata
+attached to that one digest. It cannot make a signature apply to different bytes,
+which is the entire attack immutable tags exist to prevent. An attacker who could
+write into that namespace could add or replace a signature; they could not make
+Kyverno accept it, because the policy pins the signing identity.
+
+The `dev` environment is unchanged and still fully `IMMUTABLE`, because the
+exclusion list defaults to empty.
+
+### Two: the lifecycle policy eats your signatures
+
+Chapter 1's lifecycle policy said "keep only the most recent 30 tagged images".
+That rule counts `.sig` and `.att` artefacts as images. Every build produces two
+of them, so a cap of 30 is reached after roughly ten builds, at which point ECR
+starts expiring the oldest tagged artefacts. Those are the signatures of the
+images deployed first, which are the images most likely to still be running.
+
+**The failure is quiet and delayed.** Nothing breaks at expiry time, because the
+pods are already admitted and admission has already happened. It surfaces weeks
+later when a node is replaced or a pod is rescheduled, the image is re-admitted,
+and Kyverno reports "no matching signatures" for an image that was signed
+correctly and verified fine on the day it was deployed. Working out why costs an
+afternoon.
+
+The fix is to give each class of artefact its own rule, keyed on tag prefix:
+
+| Priority | Matches | Action |
+|---|---|---|
+| 1 | untagged | expire after 14 days |
+| 2 | `sha256-*` | keep the most recent 90 |
+| 3 | `sha-*` | keep the most recent 30 |
+| 4 | any | catch-all cap |
+
+The rule priority discipline from section 9 still applies and now matters more:
+rules are evaluated in ascending order, the first match wins, an image is never
+acted on by more than one rule, and ECR requires the `any` rule to carry the
+highest number. Get the order wrong and the broad rule matches everything first
+while the narrow rules never fire, silently.
+
+---
+
+## 27. Where the AWS boundary falls, and the credential this chapter adds back
+
+### Keeping the AWS surface small was a design goal, so here it is explicitly
+
+| Component | Runs where | Cost |
+|---|---|---|
+| GitHub OIDC identity provider | **real AWS**, IAM | free |
+| Two IAM roles, push and plan | **real AWS**, IAM | free |
+| ECR repository for signed images | **real AWS**, ECR | ~$0.01/month |
+| The whole build pipeline | GitHub, public repo | free |
+| Fulcio, Rekor, signing, transparency log | Sigstore public good | free |
+| Kyverno engine and both policies | **kind** | free |
+| ArgoCD child apps and sync waves | **kind** | free |
+| Admission denial and the bypass demonstration | **kind** | free |
+| **EKS, VPC, NAT gateway** | **not needed at all** | **$0** |
+
+**The last line is the point.** Chapter 3 does not need the EKS cluster. The
+three things that must be real are identity federation, an IAM role and a
+registry, and all three are effectively free. `make apply ENV=dev` and its
+$130/month stays destroyed.
+
+This is why [terraform/environments/ci](../terraform/environments/ci) is a
+separate root module rather than a few resources bolted onto `dev`. Adding them
+to `dev` would have tied running the pipeline to applying an EKS control plane
+and a NAT gateway. There is a second reason too: the `dev` registry is destroyed
+whenever `dev` is destroyed, taking every signed image and every signature with
+it. A registry whose lifecycle is bound to an ephemeral cluster is the wrong
+shape for a registry.
+
+**What genuinely cannot be proven without EKS**, stated rather than claimed:
+IRSA supplying Kyverno's registry credentials, and the node role pulling from ECR
+with no image pull secret. Both are the subject of the next part.
+
+### The credential inventory, updated honestly
+
+Section 17 listed three credentials and said, in bold, that there was no fourth
+row. Chapter 3 adds rows. Pretending otherwise would undo the credibility that
+table bought.
+
+| # | Credential | Held by | Can do | Lifetime |
+|---|---|---|---|---|
+| 1 | kind kubeconfig | You, on your laptop | Everything, local cluster only | Until the cluster is deleted |
+| 2 | ArgoCD ServiceAccount tokens | Projected into ArgoCD's pods | Apply manifests cluster wide | Minutes, auto rotated |
+| 3 | ArgoCD admin password | A Secret, read once | Log into ArgoCD | Until changed |
+| 4 | **GitHub Actions OIDC token** | GitHub, per job | Be exchanged for the AWS role, and obtain a Fulcio certificate | ~15 minutes |
+| 5 | **AWS STS session** | The runner, in memory | Push to **one** ECR repository | 1 hour, never stored |
+| 6 | **`GITHUB_TOKEN`, `contents: write`** | GitHub, per job | Commit to this repository | The job |
+| 7 | **ECR pull secret in `demo` and `kyverno`** | **The kind cluster** | Pull images and read signatures from ECR | **12 hours, refreshed by hand** |
+| - | **The Cosign signing key** | **nobody** | | **does not exist** |
+
+Rows 4, 5 and 6 are short lived by construction and none of them is stored
+anywhere a human could copy. **Row 7 is the only genuine stored secret, and it
+exists purely because this runs on kind.**
+
+On EKS, row 7 disappears entirely. The kubelet pulls from ECR using the node's
+instance role, which is why section 8 could say Deployments have no
+`imagePullSecrets` at all, and Kyverno reads the registry through IRSA by setting
+`imageRegistryCredentials.providers: [amazon]` instead of naming a secret. A kind
+node has no AWS identity, so the stand in is a docker config secret built from
+`aws ecr get-login-password`.
+
+That token lasts **twelve hours**. When it expires, image pulls fail with a 401
+and Kyverno reports what looks like a signature failure and is actually an
+authentication failure. `make ecr-login` refreshes both copies and restarts the
+Kyverno admission controller, which caches its registry clients.
+
+There is a second, subtler cost. **That secret cannot be in Git**, because it
+contains a bearer token.
+[platform/manifests/demo-app/serviceaccount.yaml](../platform/manifests/demo-app/serviceaccount.yaml)
+references a secret that a human creates out of band, so ArgoCD will happily sync
+a ServiceAccount into a cluster where that secret does not exist. That is a real
+hole in "Git is the whole truth", it is the same class of hole that
+`CreateNamespace=true` would have opened in section 21, and unlike that one it
+cannot be closed without a secret management tool. Sealed Secrets, SOPS with age
+or the External Secrets Operator are the real answers, and section 22 already
+listed the absence of secret management as a known gap. Chapter 3 is where that
+gap starts to cost something.
+
+---
+
+## 28. What this does NOT protect against
+
+Claiming a security property without naming its limits is how you lose the room.
+Every one of these is a fair hit, and several are the first thing a competent
+reviewer will reach for.
+
+### What a signature genuinely does not say
+
+1. **A signed backdoor is still signed.** The policy proves origin and integrity.
+   It says nothing about whether the code is correct, safe or benign. Provenance
+   is not quality.
+
+2. **Anyone who can merge to `main` can get anything signed.** The pipeline signs
+   whatever is in the repository. The security boundary has **moved** to branch
+   protection and code review, not disappeared. This repository currently has no
+   branch protection, which is a gap listed in section 30 rather than hidden.
+
+3. **A malicious dependency is signed too.** If a Go module in `go.sum` is
+   compromised upstream, the pipeline builds it, signs it, and truthfully attests
+   that it was built from this repository. All correct, all useless. The SBOM
+   makes the blast radius discoverable afterwards; it prevents nothing.
+
+4. **A compromised runner or a malicious third party action can sign arbitrary
+   bytes** with the legitimate identity, because it has the OIDC token. Pinning
+   every action to a commit SHA reduces this and does not remove it. A GitHub
+   hosted runner on a public repository is not a hardened isolated builder, so
+   the honest SLSA claim here is roughly level 2 provenance authenticity rather
+   than level 3.
+
+5. **The base image is trusted implicitly.** `gcr.io/distroless/static-debian12`
+   is itself signed by Google with Cosign, and this pipeline does not verify that
+   signature. A complete supply chain policy verifies its own base images.
+
+6. **The SBOM is best effort.** Syft infers components from package metadata. A
+   vendored or statically embedded dependency with no metadata does not appear,
+   and the SBOM will confidently not mention it.
+
+### What the admission gate does not cover
+
+7. **It gates admission, not runtime.** Once a pod is admitted, nothing
+   re-verifies it. Tightening the policy tomorrow does not touch what is already
+   running.
+
+8. **Anyone with RBAC over Kyverno wins.** Editing the `ClusterPolicy`, deleting
+   the `ValidatingWebhookConfiguration`, or scaling the Kyverno deployment to
+   zero all bypass the gate completely. This protects against unsigned images,
+   not against a cluster administrator.
+
+9. **Deleting a policy file from Git silently disables the gate.** Prune is on,
+   so removing `policies/require-signed-images.yaml` in a one line pull request
+   removes the policy from the cluster. Nothing stops serving, no alert fires,
+   and every Application still reports Synced and Healthy. The mitigation is
+   branch protection and review, which is a process control rather than a
+   technical one.
+
+10. **`failurePolicy: Fail` is a deliberate availability trade.** Set to `Fail`,
+    Kyverno being unreachable means nothing can be admitted to the demo
+    namespace. Set to `Ignore`, Kyverno being unreachable means everything is
+    admitted and the gate becomes a suggestion that still reports green. This
+    project chooses `Fail` and accepts that the gate can cause an outage, because
+    a security control that fails open is theatre. With one admission controller
+    replica on kind, a pod restart is a brief window of refused admissions.
+
+11. **Excluded namespaces are a bypass route.** Kyverno excludes `kube-system`
+    and its own namespace by default, to avoid deadlocking the cluster. Anything
+    that can schedule a pod into an excluded namespace escapes the gate.
+
+12. **Scoped to the `demo` namespace only.** Every other namespace on this
+    cluster, including `argocd` and `kyverno` itself, is entirely unprotected.
+    Kyverno runs an image these policies have never looked at.
+
+### Trust model and operational limits
+
+13. **Verification depends on the public good Sigstore instance being available
+    and honest.** Rekor unreachable, combined with `failurePolicy: Fail`, means
+    no deployments. A compromised Fulcio could issue a certificate for this
+    identity, and the transparency log lets you *detect* that afterwards, which
+    is not the same as preventing it.
+
+14. **Nothing monitors Rekor** for signatures claiming this project's identity.
+    The detection mechanism exists and nobody is watching it.
+
+15. **Scan results are a snapshot.** Trivy reflects its vulnerability database at
+    build time. An image that scans clean today is vulnerable the moment a CVE is
+    published, and nothing rescans what is running.
+
+16. **The image scan passes `--ignore-unfixed`.** An unfixed CRITICAL in the base
+    image will not stop a deployment. The reasoning is in the workflow file: a
+    finding this pipeline cannot act on does not make the image safer when it
+    fails the build, it just teaches people to route around the gate. The
+    compensating control is the distroless base, which has almost no packages to
+    be vulnerable in the first place.
+
+17. **The account ID is public.** The digest reference committed to a public Git
+    repository contains it. An account ID is not a secret and grants nothing on
+    its own, but it does help an attacker enumerate role names. Accepted, and
+    recorded here rather than discovered.
+
+18. **`/version` reports what it was told.** `IMAGE_REF` and `IMAGE_DIGEST` are
+    environment variables, and a pod that lies about its own provenance is
+    trivial to construct. They are meaningful only because the same commit that
+    set them is the commit ArgoCD applied, and because Kyverno verified the
+    signature over that digest before the pod was allowed to exist. The endpoint
+    is a window onto a fact established elsewhere, not the evidence itself. The
+    one claim the application can make unaided is `binary_sha256`, which it
+    computes of itself at runtime from `/proc/self/exe`.
+
+---
+
+## 29. The GitHub OIDC trust policy, line by line
+
+This is the piece most worth reading carefully, because the failure modes are
+severe and none of them produces an error message.
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "Federated": "arn:aws:iam::<acct>:oidc-provider/token.actions.githubusercontent.com" },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": "repo:clintonsenaye/secure-delivery-platform:ref:refs/heads/main"
+    }
+  }
+}
+```
+
+**`sts:AssumeRoleWithWebIdentity`, not `sts:AssumeRole`.** The caller presents a
+token signed by a trusted issuer rather than an existing AWS identity, which is
+what removes the need for a stored AWS credential to bootstrap from.
+
+**The `aud` condition.** Without it, a GitHub token minted for some other
+audience, for example a third party service that also accepts GitHub OIDC, could
+be replayed here.
+
+**The `sub` condition. This is the line the whole pipeline rests on.** The
+failure modes, in increasing order of how bad they are:
+
+| Written as | Who can assume the role |
+|---|---|
+| omitted entirely | **Any GitHub Actions workflow in any repository on GitHub** |
+| `StringLike`, `repo:*` | the same thing with extra steps |
+| `StringLike`, `repo:owner/*` | any repository you own, including one created five minutes ago by an attacker who compromised a single collaborator account |
+| `StringEquals`, repository only | any branch, including one pushed by somebody with write access but no review rights |
+| `StringEquals`, repository and ref | only what is written |
+
+The first row is not a subtle misconfiguration. It is a public role, and it is a
+well known real world mistake.
+
+**Branch scoping does more than it looks like.** A pull request run receives the
+claim `repo:owner/name:pull_request`, with no ref component at all. That does not
+match, so **a pull request cannot obtain AWS credentials**. This is why the
+pipeline has a separate scanning job and building job rather than one job with an
+`if` condition: an `if` can be edited in the same pull request it is meant to
+constrain, and a trust policy cannot.
+
+**Two roles, not one.** The read only role used by
+[.github/workflows/terraform-plan.yml](../.github/workflows/terraform-plan.yml)
+*does* accept the `pull_request` claim, because a plan on a pull request is the
+whole point of it. Giving that role push access would let an unreviewed pull
+request publish an image. Separating them is what makes "a pull request can look
+but not touch" true by construction rather than by policy.
+
+The plan role also gets no write permission at all, which is why the workflow
+runs `terraform plan -lock=false`: acquiring the S3 native lock means writing a
+`.tflock` object, and a role that can still write a lock file is not read only.
+
+### Three smaller things worth knowing
+
+- **`ecr:GetAuthorizationToken` has to be on `"*"`.** It is a registry level
+  action with no repository ARN to attach to. It returns a login token whose
+  actual scope is still governed by the other statements, so the wildcard grants
+  the ability to authenticate rather than the ability to push. Everything that
+  moves bytes is scoped to one repository ARN.
+- **An AWS account holds exactly one OIDC provider per issuer URL.** If another
+  project registered GitHub first, `terraform apply` fails with
+  `EntityAlreadyExists`. The module takes a `create_oidc_provider` boolean and
+  looks up the existing one instead.
+- **The thumbprint is vestigial.** Since 2023, IAM validates
+  `token.actions.githubusercontent.com` against a trusted root certificate
+  authority and ignores the thumbprint list, which is why the SHA1 fingerprint a
+  hundred tutorials tell you to paste has changed twice without breaking anyone.
+  It is left empty deliberately, because supplying a stale value implies it
+  matters.
+
+### The stronger version, not built
+
+`sub: repo:owner/name:environment:production`, combined with a GitHub environment
+carrying protection rules, requires a human approval before the role can be
+assumed at all. It is one line and it is the correct production answer. It is not
+built here because a single operator approving their own deployments is ceremony
+rather than control.
+
+---
+
+## 30. Known gaps in chapter 3
+
+Written down deliberately, because an unlisted gap looks like an oversight and a
+listed one looks like a roadmap.
+
+- **No branch protection on `main`.** The single largest gap, and the one that
+  most weakens the claim. The gate proves an image came from this pipeline; the
+  pipeline builds whatever is on `main`. Requiring review before merge is what
+  makes "from this repository" mean something. It costs nothing and is the first
+  thing to fix.
+- **The policies cover one namespace.** Section 28, limit 12. The real pattern is
+  to enforce cluster wide and carve out the few namespaces that genuinely cannot
+  comply.
+- **Kyverno's own images are not verified.** Nor are ArgoCD's, nor the distroless
+  base. The platform holds workloads to a standard it does not yet meet itself.
+- **No ArgoCD Project restricting destinations or resource kinds.** Carried over
+  from section 22, and it matters more now: the same mechanism that delivers the
+  policies could be used to delete them.
+- **The SBOM attestation is produced but not required at admission.** Both
+  policies check the signature and the provenance. Nothing requires an SBOM to be
+  present. That is a deliberate scope decision rather than an oversight: an SBOM
+  is an inventory, not a trust claim, and requiring one at admission tests
+  whether a document exists rather than whether it is true.
+- **Nothing monitors Rekor.** Section 28, limit 14.
+- **One Kyverno admission controller replica.** Correct for a laptop, wrong
+  anywhere else, and with `failurePolicy: Fail` it means a pod restart is a brief
+  admission outage. Production is three replicas with a PodDisruptionBudget.
+- **The ECR pull secret is not in Git and expires every 12 hours.** Section 27.
+  It disappears on EKS.
+- **No image signature verification at the registry level.** ECR supports
+  pull-through policies and AWS Signer; this project verifies only at admission.
+  Defence in depth would do both, so that an image cannot even be pulled without
+  a valid signature.
+- **`cosignOCI11: true` on the provenance policy is the fiddliest
+  interoperability point in the chapter.** GitHub's attestation is stored using
+  the OCI 1.1 referrers API, and registries that do not implement it fall back to
+  a tag schema. If the signature policy passes and the provenance policy fails,
+  that flag is the first thing to change.
+- **The Dockerfile's base images are pinned by tag, not by digest.**
+  `golang:1.25-alpine` and `gcr.io/distroless/static-debian12:nonroot` are both
+  mutable references. This is the exact inconsistency section 24 spends two pages
+  arguing against, applied to the one place chapter 3 did not fix. It is listed
+  rather than defended. The reason it has not been done is prosaic: a digest
+  pinned base has to be bumped by hand or by a tool on every upstream security
+  patch, and Dependabot's Docker ecosystem support updates tags more reliably
+  than digests. That is a reason, not a justification.
+- **Chart and image versions are pinned but not verified.** ArgoCD and Kyverno
+  are both installed from pinned Helm chart versions, which is reproducible. A
+  pinned version is not a verified artefact, and chapter 2 already flagged the
+  same inconsistency for the ArgoCD image.

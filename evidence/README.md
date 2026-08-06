@@ -33,6 +33,28 @@ Chapter 2 runs entirely on kind, so there is no account ID, no public IP and no
 cloud console in any of these. The checks in the section below still apply to the
 terminal chrome.
 
+## Chapter 3: supply chain security
+
+To be captured. The script is demonstration 3 in
+[docs/demonstrations.md](../docs/demonstrations.md).
+
+| File | What it proves |
+|---|---|
+| 13 | The pipeline: scan, OIDC role assumption with no stored key, push, sign, attest |
+| 14 | `cosign verify` passing against the image the cluster is actually running |
+| 15 | An unsigned image pushed to the real ECR repository outside the pipeline, successfully |
+| 16 | Kyverno rejecting that image at admission, with the reason on screen |
+| 17 | The same image signed with a valid personal Cosign identity, still rejected |
+| 18 | ECR refusing to overwrite an existing tag, immutability doing its own job |
+
+**Unlike chapters 1 and 2, chapter 3 screenshots contain the AWS account ID**,
+because an ECR image reference embeds it. That is not redacted, and the reasoning
+is in [docs/demonstrations.md](../docs/demonstrations.md) under "Capturing
+evidence": the same account ID is committed to
+[platform/manifests/demo-app/deployment.yaml](../platform/manifests/demo-app/deployment.yaml)
+in this public repository, so blanking it out of an image would be theatre rather
+than a control. What must not appear is any live ECR authentication token.
+
 ## What is redacted, and why
 
 These screenshots were taken on a working machine and published to a public
