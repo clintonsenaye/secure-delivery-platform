@@ -33,6 +33,35 @@ variable "github_repository" {
   default     = "clintonsenaye/secure-delivery-platform"
 }
 
+variable "github_owner_id" {
+  description = <<-EOT
+    The immutable numeric ID of the GitHub account that owns the repository.
+
+    REQUIRED, with no default, for the same reason public_access_cidrs has no
+    default in the dev environment: it is a security boundary, and supplying it
+    should be a conscious act rather than something inherited from a value
+    somebody set once.
+
+    Get it with:
+      gh api repos/OWNER/NAME --jq .owner.id
+  EOT
+  type        = string
+}
+
+variable "github_repository_id" {
+  description = <<-EOT
+    The immutable numeric ID of the repository.
+
+    Together with github_owner_id, this is what makes the trust policy name a
+    specific repository that has existed since a specific moment, rather than
+    whatever currently holds a given name. See docs/architecture.md section 29.
+
+    Get it with:
+      gh api repos/OWNER/NAME --jq .id
+  EOT
+  type        = string
+}
+
 variable "github_push_refs" {
   description = "Git refs whose workflow runs may assume the ECR push role. Exact refs only; the trust policy uses StringEquals."
   type        = list(string)

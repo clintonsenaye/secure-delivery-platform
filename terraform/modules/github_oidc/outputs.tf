@@ -14,8 +14,35 @@ output "plan_role_arn" {
 }
 
 output "allowed_push_subjects" {
-  description = "The exact `sub` claims permitted to assume the push role. Worth reading back after apply, because this is the boundary the whole pipeline rests on."
+  description = <<-EOT
+    The exact `sub` claims permitted to assume the push role.
+
+    Read this back after apply and compare it, character for character, against
+    the `sub` value CloudTrail records on a failed AssumeRoleWithWebIdentity.
+    That comparison is the whole diagnosis: the two strings either match or they
+    do not, and StringEquals has no opinion about how nearly they match.
+  EOT
   value       = local.push_subjects
+}
+
+output "allowed_plan_subjects" {
+  description = "The exact `sub` claims permitted to assume the read only plan role. Emitted for the same reason as the push subjects: so a mismatch can be diffed rather than guessed at."
+  value       = var.create_plan_role ? local.plan_subjects : []
+}
+
+output "repository_claim" {
+  description = <<-EOT
+    The immutable identifier form of this repository, without any ref suffix:
+
+      repo:OWNER@OWNER-ID/NAME@REPO-ID
+
+    Both roles' subject conditions are built from this one string, so if it is
+    wrong, everything is wrong in the same direction. Compare it against what
+    GitHub actually sends:
+
+      gh api repos/OWNER/NAME --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
+  EOT
+  value       = local.repo_claim
 }
 
 output "workflow_identity" {

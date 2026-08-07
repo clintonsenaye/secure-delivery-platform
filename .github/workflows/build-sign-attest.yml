@@ -20,8 +20,10 @@
 #   deploy  writes the digest into Git. Holds contents:write and nothing else.
 #
 # Splitting them is not tidiness. A pull request run receives an OIDC subject
-# claim of the shape `repo:owner/name:pull_request`, and the IAM trust policy in
-# terraform/modules/github_oidc only accepts `repo:owner/name:ref:refs/heads/main`.
+# claim ending in `:pull_request`, and the IAM trust policy in
+# terraform/modules/github_oidc only accepts one ending in `:ref:refs/heads/main`.
+# (Both claims begin with the repository's immutable identifier form,
+# `repo:OWNER@OWNER-ID/NAME@REPO-ID`. See docs/architecture.md section 29.)
 # So a pull request CANNOT obtain AWS credentials. That is enforced by the shape
 # of the claim rather than by an `if` in this file, which is the stronger place
 # to enforce it: an `if` can be edited in the same pull request it is meant to

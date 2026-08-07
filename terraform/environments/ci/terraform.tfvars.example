@@ -15,6 +15,46 @@ owner = "your-name"
 # nobody can assume, which is the safe direction to fail in.
 github_repository = "clintonsenaye/secure-delivery-platform"
 
+##############################################################################
+# IMMUTABLE IDENTIFIERS. REQUIRED. THE VALUES BELOW ARE PLACEHOLDERS.
+#
+# Replace both before applying, or the roles will exist and nothing will be able
+# to assume them.
+#
+# Since 15 July 2026, GitHub builds the OIDC subject claim from the repository's
+# permanent numeric IDs as well as its names:
+#
+#   repo:OWNER@OWNER-ID/NAME@REPO-ID:ref:refs/heads/main
+#
+# The @ separator is used because @ cannot appear in a GitHub username or
+# repository name.
+#
+# Fetch the real values for your repository in one command:
+#
+#   gh api repos/clintonsenaye/secure-delivery-platform \
+#     --jq '{owner_id: .owner.id, repository_id: .id}'
+#
+# Or read the whole claim back in the exact form the trust policy needs:
+#
+#   gh api repos/clintonsenaye/secure-delivery-platform \
+#     --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
+#
+# These are NOT secrets. Both are returned by the unauthenticated GitHub API for
+# any public repository. They are here rather than hardcoded in the module for
+# the same reason `owner` is: the module should describe the shape of the trust
+# boundary, and this file should say whose it is.
+#
+# If AssumeRoleWithWebIdentity is being refused, compare these against the `sub`
+# value in the CloudTrail event, character for character. The workflow logs never
+# show the claim. See docs/architecture.md section 29.
+##############################################################################
+
+# PLACEHOLDER. Get yours: gh api repos/OWNER/NAME --jq .owner.id
+github_owner_id = "000000000"
+
+# PLACEHOLDER. Get yours: gh api repos/OWNER/NAME --jq .id
+github_repository_id = "0000000000"
+
 # REQUIRED for a working `terraform plan` on pull requests. The ARN of the state
 # bucket created by `make bootstrap`:
 #

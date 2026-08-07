@@ -48,6 +48,28 @@ output "allowed_push_subjects" {
   value       = module.github_oidc.allowed_push_subjects
 }
 
+output "github_repository" {
+  description = "The repository these roles trust, as owner/name. Emitted so `make ci-config` can query the GitHub API for the live IDs and diff them against what Terraform applied."
+  value       = var.github_repository
+}
+
+output "allowed_plan_subjects" {
+  description = "The exact OIDC subject claims permitted to assume the read only plan role."
+  value       = module.github_oidc.allowed_plan_subjects
+}
+
+output "repository_claim" {
+  description = <<-EOT
+    The immutable identifier form of this repository, as the trust policies see
+    it. Compare against what GitHub actually sends:
+
+      gh api repos/OWNER/NAME --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
+
+    and against the `sub` field of a CloudTrail AssumeRoleWithWebIdentity event.
+  EOT
+  value       = module.github_oidc.repository_claim
+}
+
 output "cosign_certificate_identity" {
   description = <<-EOT
     The Fulcio certificate identity a run of the build workflow signs with.
