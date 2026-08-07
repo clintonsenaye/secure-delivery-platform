@@ -115,7 +115,7 @@ spec:
           # sequence is: apply the ci Terraform, push to main, let the workflow
           # finish, pull, and only then bring the cluster up.
           ##################################################################
-          image: 466826557930.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:8b103a66def33426e14b01130793b620583aa73c3cc4440b80a0d0765055c70a
+          image: 466826557930.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:fc48dc1f6bd8c714001d6a893c4737b070436deea51eb28db2fae0142f08183f
           # IfNotPresent is correct and cheap for a digest reference. A digest
           # already in the node's image store can only be the bytes that digest
           # names, so re-pulling could not possibly get anything different.
@@ -165,9 +165,9 @@ spec:
             # anyone is binary_sha256, which it computes of itself at runtime by
             # reading /proc/self/exe.
             - name: IMAGE_REF
-              value: 466826557930.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:8b103a66def33426e14b01130793b620583aa73c3cc4440b80a0d0765055c70a
+              value: 466826557930.dkr.ecr.eu-west-2.amazonaws.com/secure-delivery-ci/app@sha256:fc48dc1f6bd8c714001d6a893c4737b070436deea51eb28db2fae0142f08183f
             - name: IMAGE_DIGEST
-              value: "sha256:8b103a66def33426e14b01130793b620583aa73c3cc4440b80a0d0765055c70a"
+              value: "sha256:fc48dc1f6bd8c714001d6a893c4737b070436deea51eb28db2fae0142f08183f"
           # Container level security context. The pod level one above cannot
           # express these, because they are properties of the container.
           securityContext:
