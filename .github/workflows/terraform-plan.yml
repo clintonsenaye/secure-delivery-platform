@@ -22,7 +22,8 @@
 # It is a second, read only role created by the same Terraform module. That
 # separation is the point. A pull request can be opened by anyone, including from
 # a fork by somebody with no write access to this repository, and a pull request
-# run receives the OIDC subject claim `repo:owner/name:pull_request`. The build
+# run receives the OIDC subject claim `repo:OWNER@ID/NAME@ID:pull_request`, whose
+# suffix is `pull_request` rather than a ref. The build
 # role's trust policy does not accept that claim, so an untrusted pull request
 # cannot obtain credentials that can push an image. It can only look.
 #
@@ -201,8 +202,35 @@ jobs:
           # deliberate, so a CI log never publishes a home IP address.
           TF_VAR_owner: github-actions
           TF_VAR_public_access_cidrs: '["203.0.113.10/32"]'
+
+          # The ci environment's immutable identifier variables, taken from the
+          # GitHub context rather than from a repository variable or a hardcoded
+          # placeholder.
+          #
+          # This is deliberate and it is the neatest part of this workflow. These
+          # are the same numbers GitHub puts in the OIDC subject claim it just
+          # used to obtain the credentials this job is running with. So the plan
+          # is not checking the trust policy against a value somebody typed into
+          # a settings page months ago; it is checking it against the identity
+          # GitHub is asserting right now.
+          #
+          # If somebody edits github_owner_id or github_repository_id in
+          # terraform.tfvars to a wrong value, this plan shows a diff on the
+          # trust policy on the next pull request. A placeholder would have shown
+          # that diff permanently and taught everyone to ignore it.
+          TF_VAR_github_owner_id: ${{ github.repository_owner_id }}
+          TF_VAR_github_repository_id: ${{ github.repository_id }}
         run: |
           set -euo pipefail
+          # Fail loudly rather than planning against an empty identity. An empty
+          # string would produce a trust policy matching `repo:owner@/name@:...`,
+          # which nothing can ever assume, and a plan diff that looks like
+          # somebody deliberately locked the role.
+          if [ "${{ matrix.env }}" = "ci" ]; then
+            : "${TF_VAR_github_owner_id:?github.repository_owner_id was empty}"
+            : "${TF_VAR_github_repository_id:?github.repository_id was empty}"
+          fi
+
           # -lock=false because the role assumed above is genuinely read only and
           # cannot write the .tflock object. A plan does not mutate state, so the
           # only risk forgone is reading a state file mid write, which produces a

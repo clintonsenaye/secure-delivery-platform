@@ -11,6 +11,9 @@ variable "github_repository" {
     interpolated into the trust policy's `sub` condition, and a trust policy
     without a correctly scoped `sub` condition can be assumed by any GitHub
     Actions workflow in any repository on GitHub.
+
+    Since July 2026 the name alone is no longer the whole claim. It is paired
+    with the immutable numeric IDs below. See github_repository_id.
   EOT
   type        = string
 
@@ -20,13 +23,75 @@ variable "github_repository" {
   }
 }
 
+##############################################################################
+# Immutable identifiers.
+#
+# These two variables are why the trust policy works at all. Read
+# docs/architecture.md section 29 before changing either of them.
+##############################################################################
+
+variable "github_owner_id" {
+  description = <<-EOT
+    The immutable numeric ID of the GitHub user or organisation that owns the
+    repository. NOT the username.
+
+    Get it with:
+      gh api repos/OWNER/NAME --jq .owner.id
+
+    A string rather than a number on purpose. This is an identifier, not a
+    quantity: nothing is ever added to it or compared for size, and treating it
+    as a number invites Terraform to render it in a form that does not match the
+    claim byte for byte.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_owner_id))
+    error_message = "github_owner_id must be the numeric owner ID, digits only. Get it with: gh api repos/OWNER/NAME --jq .owner.id"
+  }
+}
+
+variable "github_repository_id" {
+  description = <<-EOT
+    The immutable numeric ID of the repository itself. NOT the repository name.
+
+    Get it with:
+      gh api repos/OWNER/NAME --jq .id
+
+    WHY THIS EXISTS AT ALL.
+
+    GitHub's OIDC subject claim used to be built from mutable names:
+
+      repo:clintonsenaye/secure-delivery-platform:ref:refs/heads/main
+
+    Names can be renamed, transferred, deleted and recreated. Since 15 July 2026
+    GitHub embeds the permanent numeric IDs alongside the names, using @ as the
+    separator because @ cannot appear in a GitHub username or repository name:
+
+      repo:clintonsenaye@57267374/secure-delivery-platform@1323617369:ref:refs/heads/main
+
+    A trust policy written against the old shape does not match the new one, and
+    because the condition is StringEquals it fails closed: AssumeRoleWithWebIdentity
+    is refused and the pipeline cannot reach AWS at all.
+
+    The full argument, the attack this prevents, and how it was diagnosed are in
+    docs/architecture.md section 29.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "github_repository_id must be the numeric repository ID, digits only. Get it with: gh api repos/OWNER/NAME --jq .id"
+  }
+}
+
 variable "push_allowed_refs" {
   description = <<-EOT
     Git refs whose workflow runs may assume the ECR push role.
 
     Kept to refs/heads/main deliberately. A pull request run receives the subject
-    claim `repo:owner/name:pull_request` rather than a ref claim, so it cannot
-    match this list and cannot obtain AWS credentials at all. That is enforced by
+    claim ending in `:pull_request` rather than a ref claim, so it cannot match
+    this list and cannot obtain AWS credentials at all. That is enforced by
     the shape of the claim rather than by an `if` in the workflow file, which is
     the stronger place to enforce it.
 
@@ -72,9 +137,11 @@ variable "plan_allowed_subjects" {
   description = <<-EOT
     Full subject claims permitted to assume the read only plan role.
 
-    Written as complete claims rather than refs because a pull request run's
-    claim has a different shape: `repo:owner/name:pull_request`, with no ref
-    component at all. Interpolated with the repository name in main.tf.
+    Written as complete claim suffixes rather than refs, because a pull request
+    run's claim has a different shape: it ends in `:pull_request`, with no ref
+    component at all. The immutable identifier prefix
+    `repo:OWNER@OWNER-ID/NAME@REPO-ID` is prepended in main.tf, so it is written
+    once and both roles share it.
 
     The defaults are pull requests and pushes to main, which is exactly when a
     plan is useful.

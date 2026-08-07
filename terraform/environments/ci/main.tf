@@ -108,6 +108,21 @@ module "github_oidc" {
   github_repository    = var.github_repository
   create_oidc_provider = var.create_github_oidc_provider
 
+  # The immutable numeric IDs GitHub embeds in the OIDC subject claim.
+  #
+  # These are not cosmetic. Since 15 July 2026 GitHub sends
+  #
+  #   repo:OWNER@OWNER-ID/NAME@REPO-ID:ref:refs/heads/main
+  #
+  # and a trust policy built from names alone does not match it, so
+  # AssumeRoleWithWebIdentity is refused and the pipeline cannot reach AWS.
+  #
+  # They are also the stronger thing to match on, not merely the newer thing:
+  # a name can be released and taken by somebody else, and an ID cannot. See
+  # docs/architecture.md section 29.
+  github_owner_id      = var.github_owner_id
+  github_repository_id = var.github_repository_id
+
   # Push is scoped to main. A pull request run receives a differently shaped
   # subject claim and cannot assume this role at all, which is why the scanning
   # job and the build job are separate jobs rather than one job with an `if`.

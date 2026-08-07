@@ -352,6 +352,36 @@ ci-config: ## Print the GitHub repository variables and policy values to set
 	@printf "  %-22s %s\n" "AWS_REGION" "$$(cd $(CI_TF_DIR) && terraform output -raw aws_region 2>/dev/null || echo eu-west-2)"
 	@printf "  %-22s %s\n" "TF_STATE_BUCKET" "$$(cd terraform/bootstrap && terraform output -raw state_bucket_name 2>/dev/null || echo '<run make bootstrap>')"
 	@echo ""
+	@echo "$(BOLD)The OIDC subject claim the trust policies require$(RESET)"
+	@echo ""
+	@echo "  Since 15 July 2026 GitHub embeds the repository's permanent numeric"
+	@echo "  IDs in this claim. A policy built from names alone does not match,"
+	@echo "  and StringEquals refuses the request. See architecture.md section 29."
+	@echo ""
+	@echo "  terraform says:"
+	@echo "    $$(cd $(CI_TF_DIR) && terraform output -raw repository_claim 2>/dev/null || echo '<apply first>')"
+	@echo "  github says:"
+	@if command -v gh >/dev/null 2>&1; then \
+	  repo="$$(cd $(CI_TF_DIR) && terraform output -raw github_repository 2>/dev/null || echo '')"; \
+	  if [ -n "$$repo" ]; then \
+	    echo "    $$(gh api "repos/$$repo" --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"' 2>/dev/null || echo '<gh api failed, are you authenticated?>')"; \
+	  else \
+	    echo "    <apply first>"; \
+	  fi; \
+	else \
+	  echo "    <gh not installed: gh api repos/OWNER/NAME --jq '\"repo:\\(.owner.login)@\\(.owner.id)/\\(.name)@\\(.id)\"'>"; \
+	fi
+	@echo ""
+	@echo "$(AMBER)Those two lines must be identical, character for character.$(RESET)"
+	@echo "If role assumption is being refused, they are not, and the difference"
+	@echo "is the whole diagnosis. The workflow logs never show the claim; read it"
+	@echo "from a CloudTrail AssumeRoleWithWebIdentity event instead:"
+	@echo ""
+	@echo "  aws cloudtrail lookup-events \\"
+	@echo "    --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \\"
+	@echo "    --max-results 5 --query 'Events[].CloudTrailEvent' --output text \\"
+	@echo "    | jq -r '.userIdentity.userName? // .requestParameters?, .errorMessage?'"
+	@echo ""
 	@echo "$(BOLD)These must match policies/*.yaml exactly$(RESET)"
 	@echo ""
 	@echo "  subject:"

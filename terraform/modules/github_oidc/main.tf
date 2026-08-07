@@ -37,21 +37,69 @@ locals {
   # is the ARN the trust policies reference.
   oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.existing[0].arn
 
-  # The subject claims, built rather than hand written, so the repository name
-  # appears in exactly one place in this module.
+  # The repository, split once so the owner and the name can be paired with
+  # their immutable IDs below.
+  github_owner = split("/", var.github_repository)[0]
+  github_name  = split("/", var.github_repository)[1]
+
+  # THE SUBJECT CLAIM PREFIX, IN GITHUB'S IMMUTABLE IDENTIFIER FORM.
   #
-  # A push to a branch produces:  repo:owner/name:ref:refs/heads/main
-  # A pull request run produces:  repo:owner/name:pull_request
+  # Built rather than hand written, so it appears in exactly one place in this
+  # module and both roles cannot drift apart.
   #
-  # Those are different shapes, which is why the two roles below take their
-  # allowed subjects in two different forms.
-  push_subjects = [for r in var.push_allowed_refs : "repo:${var.github_repository}:ref:${r}"]
-  plan_subjects = [for s in var.plan_allowed_subjects : "repo:${var.github_repository}:${s}"]
+  # The shape, since GitHub changed it on 15 July 2026:
+  #
+  #   repo:OWNER@OWNER-ID/NAME@REPO-ID
+  #
+  # producing, for this project:
+  #
+  #   repo:clintonsenaye@57267374/secure-delivery-platform@1323617369
+  #
+  # The @ separator is not decoration. It was chosen because @ cannot appear in
+  # a GitHub username or repository name, so the delimiter can never be confused
+  # with part of a name no matter what anyone calls their repository.
+  #
+  # The OLD shape, which this module used until the trust policy started
+  # refusing every request, was simply:
+  #
+  #   repo:clintonsenaye/secure-delivery-platform
+  #
+  # StringEquals does not match one against the other. See section 29 of
+  # docs/architecture.md for the diagnosis and for why the IDs are the stronger
+  # thing to match on rather than merely the newer thing.
+  repo_claim = "repo:${local.github_owner}@${var.github_owner_id}/${local.github_name}@${var.github_repository_id}"
+
+  # The two roles need differently shaped claims after that common prefix.
+  #
+  # A push to a branch produces:  <prefix>:ref:refs/heads/main
+  # A pull request run produces:  <prefix>:pull_request
+  #
+  # Note that the immutable ID change altered the PREFIX only. The suffix that
+  # distinguishes a branch push from a pull request run is unchanged, which is
+  # why the separation between the push role and the plan role still holds
+  # exactly as it did before.
+  push_subjects = [for r in var.push_allowed_refs : "${local.repo_claim}:ref:${r}"]
+  plan_subjects = [for s in var.plan_allowed_subjects : "${local.repo_claim}:${s}"]
 
   # The certificate identity Fulcio will put in the signing certificate's subject
   # alternative name for a run of the build workflow. Exported as an output so
   # the Kyverno policy and the demonstration commands can be checked against the
   # infrastructure rather than against someone's memory.
+  #
+  # DELIBERATELY STILL THE NAME FORM, with no IDs in it.
+  #
+  # This is a DIFFERENT CLAIM from the one above, and conflating the two is the
+  # obvious way to turn one broken thing into two. AWS validates `sub`. Fulcio
+  # builds the certificate's subject alternative name from `job_workflow_ref`,
+  # which is a URL and has always been a URL. The 15 July 2026 change was to
+  # `sub` only, so the Kyverno policies in policies/ were never affected by the
+  # failure that broke role assumption, and rewriting them to chase it would have
+  # broken image verification for no reason.
+  #
+  # That is reasoning rather than observation: this project has not yet produced
+  # a real signature to read a certificate out of. Confirm it from the first one.
+  # The build workflow's own verification step fails loudly if it is wrong, which
+  # is exactly why that step exists.
   workflow_identity_prefix = "https://github.com/${var.github_repository}/.github/workflows"
 }
 
@@ -122,7 +170,7 @@ data "aws_iam_policy_document" "push_assume" {
     # THE SUBJECT CHECK. THE LINE THIS WHOLE MODULE EXISTS FOR.
     #
     # `sub` identifies which workflow run is asking. Scoped here to this
-    # repository AND this branch.
+    # repository, by immutable ID, AND this branch.
     #
     # The failure modes, in order of how bad they are:
     #
@@ -130,17 +178,28 @@ data "aws_iam_policy_document" "push_assume" {
     #                        GitHub can assume this role. This is not a subtle
     #                        misconfiguration, it is a public role.
     #   StringLike "repo:*"  the same thing with extra steps.
+    #   StringLike "repo:owner@*"
+    #                        does not help. The IDs are only worth having if
+    #                        they are matched exactly; a wildcard over them
+    #                        throws away the entire property they provide.
     #   StringLike "repo:owner/*"
     #                        any repository owned by you, including one created
     #                        five minutes ago by an attacker who compromised a
     #                        single collaborator account.
-    #   StringEquals, repo only
-    #                        any branch, including a branch pushed by someone
-    #                        with write access but no review rights.
+    #   StringEquals, names but no IDs
+    #                        the old shape. Survives a rename of your repository
+    #                        and, much worse, ALSO matches a completely different
+    #                        repository that later takes the same name. See
+    #                        docs/architecture.md section 29.
+    #   StringEquals, repo only, no ref
+    #                        any branch, including one pushed by someone with
+    #                        write access but no review rights.
     #
-    # StringEquals against a fixed list of full claims is the strongest form.
-    # The cost is that adding a branch or a tag trigger is a Terraform change,
-    # which is the correct amount of friction for widening a trust boundary.
+    # StringEquals against a fixed list of full claims carrying immutable IDs is
+    # the strongest form available. The cost is that adding a branch or a tag
+    # trigger is a Terraform change, which is the correct amount of friction for
+    # widening a trust boundary, and that renaming the repository is also a
+    # Terraform change, which is discussed in section 29.
     condition {
       test     = "StringEquals"
       variable = "${local.oidc_issuer_host}:sub"
@@ -261,13 +320,21 @@ data "aws_iam_policy_document" "plan_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Scoped to this repository, and to pull request runs plus pushes to main.
+    # Scoped to this repository by immutable ID, and to pull request runs plus
+    # pushes to main.
     #
     # Note the pull request claim has no ref component: a run triggered by a pull
-    # request always gets `repo:owner/name:pull_request` regardless of which
-    # branch the pull request came from. That includes pull requests opened from
-    # forks by people with no write access at all, which is precisely why this
-    # role is read only and why it is a different role from the push one.
+    # request always gets `<repo-claim>:pull_request` regardless of which branch
+    # the pull request came from. That includes pull requests opened from forks
+    # by people with no write access at all, which is precisely why this role is
+    # read only and why it is a different role from the push one.
+    #
+    # This role was broken by the 15 July 2026 subject claim change in exactly
+    # the same way the push role was, and is fixed by the same shared
+    # local.repo_claim. Fixing one and not the other would have produced a
+    # pipeline that could build and push but whose pull request checks silently
+    # stopped planning, which is the more dangerous half to leave broken because
+    # a missing check looks like a passing one.
     condition {
       test     = "StringEquals"
       variable = "${local.oidc_issuer_host}:sub"

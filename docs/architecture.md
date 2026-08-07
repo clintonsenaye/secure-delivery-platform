@@ -1597,11 +1597,16 @@ severe and none of them produces an error message.
   "Condition": {
     "StringEquals": {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:clintonsenaye/secure-delivery-platform:ref:refs/heads/main"
+      "token.actions.githubusercontent.com:sub": "repo:clintonsenaye@57267374/secure-delivery-platform@1323617369:ref:refs/heads/main"
     }
   }
 }
 ```
+
+If that `sub` value looks like it has been mangled, it has not. Those numbers are
+GitHub's **immutable identifiers**, and the subsection below is about why they
+are there, what they defend against, and how their absence broke this pipeline in
+a way that produced no error message anywhere a developer would look.
 
 **`sts:AssumeRoleWithWebIdentity`, not `sts:AssumeRole`.** The caller presents a
 token signed by a trusted issuer rather than an existing AWS identity, which is
@@ -1619,15 +1624,17 @@ failure modes, in increasing order of how bad they are:
 | omitted entirely | **Any GitHub Actions workflow in any repository on GitHub** |
 | `StringLike`, `repo:*` | the same thing with extra steps |
 | `StringLike`, `repo:owner/*` | any repository you own, including one created five minutes ago by an attacker who compromised a single collaborator account |
-| `StringEquals`, repository only | any branch, including one pushed by somebody with write access but no review rights |
-| `StringEquals`, repository and ref | only what is written |
+| `StringLike` over the ID portion | nothing gained. An identifier matched with a wildcard is a name again |
+| `StringEquals`, names but no IDs | this repository, **or anything that later takes this repository's name.** See below |
+| `StringEquals`, repository only, no ref | any branch, including one pushed by somebody with write access but no review rights |
+| `StringEquals`, IDs and ref | only what is written |
 
 The first row is not a subtle misconfiguration. It is a public role, and it is a
 well known real world mistake.
 
 **Branch scoping does more than it looks like.** A pull request run receives the
-claim `repo:owner/name:pull_request`, with no ref component at all. That does not
-match, so **a pull request cannot obtain AWS credentials**. This is why the
+claim `repo:OWNER@ID/NAME@ID:pull_request`, with no ref component at all. That
+does not match, so **a pull request cannot obtain AWS credentials**. This is why the
 pipeline has a separate scanning job and building job rather than one job with an
 `if` condition: an `if` can be edited in the same pull request it is meant to
 constrain, and a trust policy cannot.
@@ -1642,6 +1649,228 @@ but not touch" true by construction rather than by policy.
 The plan role also gets no write permission at all, which is why the workflow
 runs `terraform plan -lock=false`: acquiring the S3 native lock means writing a
 `.tflock` object, and a role that can still write a lock file is not read only.
+
+### Immutable identifiers, and the day the trust policy stopped matching
+
+This is the part of chapter 3 that was learned rather than designed, so it is
+written up as it happened.
+
+#### The symptom
+
+Every run of the build workflow failed at the `configure-aws-credentials` step.
+Not intermittently: every time, immediately, with a message that amounted to
+"not authorized to perform sts:AssumeRoleWithWebIdentity".
+
+That message is unhelpful in a specific and frustrating way. It is what you get
+when the role does not exist, when the OIDC provider is not registered, when the
+audience is wrong, when the subject is wrong, and when the role's trust policy
+is fine but its permissions are not. Five very different problems, one error.
+
+**And the workflow log never prints the token.** It cannot: the OIDC token is a
+credential, and a runner that echoed it into a public build log would be handing
+out the ability to assume the role. So the one piece of information needed to
+tell those five cases apart, the actual `sub` claim GitHub sent, is deliberately
+absent from the place everybody looks first.
+
+#### The diagnosis, from CloudTrail
+
+The claim is absent from the workflow log. It is not absent from **CloudTrail**,
+because AWS records what it was asked to do and why it declined.
+
+`sts:AssumeRoleWithWebIdentity` appears in CloudTrail as a management event
+whether it succeeds or fails, and a failed one carries both the `errorMessage`
+and, critically, the subject claim AWS evaluated. So the question stops being
+"why is my trust policy wrong" and becomes the far more answerable "what string
+did AWS actually compare against, and what string did I write".
+
+```bash
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --max-results 10 \
+  --query 'Events[].CloudTrailEvent' --output text \
+  | jq -r 'select(.errorCode != null)
+           | {error: .errorCode, message: .errorMessage,
+              sub: .requestParameters.subjectFromWebIdentityToken,
+              role: .requestParameters.roleArn}'
+```
+
+What came back was this:
+
+```text
+repo:clintonsenaye@57267374/secure-delivery-platform@1323617369:ref:refs/heads/main
+```
+
+against a trust policy that said:
+
+```text
+repo:clintonsenaye/secure-delivery-platform:ref:refs/heads/main
+```
+
+Which is the entire diagnosis. `StringEquals` has no opinion about how nearly two
+strings match, and it was right to refuse.
+
+**The lesson is more general than this one bug.** When a federated identity is
+refused, the log on the *asking* side tells you the request failed and the log on
+the *answering* side tells you what was asked. Reach for the answering side
+first. In this project the same shape applies to Kyverno: `kubectl` prints that a
+pod was rejected, and the Kyverno admission controller's log prints what it
+compared. Two logs, and only one of them contains the fact.
+
+#### What immutable identifiers are
+
+Every GitHub account and every repository has a permanent numeric ID, assigned at
+creation and never reused or changed. `clintonsenaye` is a display name that can
+be changed on a whim; `57267374` is what that account *is*. The same holds for
+repositories: `secure-delivery-platform` is a label, `1323617369` is the object.
+
+Until July 2026 GitHub's OIDC subject claim used only the labels:
+
+```text
+repo:OWNER/NAME:ref:refs/heads/BRANCH
+```
+
+Since **15 July 2026** it carries both, with the ID attached to each name:
+
+```text
+repo:OWNER@OWNER-ID/NAME@REPO-ID:ref:refs/heads/BRANCH
+```
+
+The `@` separator is not arbitrary. It was chosen because `@` cannot appear in a
+GitHub username or repository name, so the delimiter can never be mistaken for
+part of a name no matter what anybody calls their repository. That is the same
+class of reasoning as choosing a field separator that cannot occur in the data,
+and it is the sort of small decision that stops a parsing bug becoming a security
+bug.
+
+The rollout matters for anyone reading this and finding their own policy still
+works:
+
+- Repositories **created after 15 July 2026** use the new format automatically.
+- Repositories **renamed or transferred after that date** adopt it.
+- **Existing repositories keep the old format until they opt in**, through a
+  toggle in the repository or organisation OIDC settings.
+
+So a trust policy written from a tutorial in 2025 keeps working, right up until
+the day somebody renames a repository, and then fails closed with the unhelpful
+error above. The failure is delayed, unrelated to any change in the
+infrastructure code, and triggered by an action that looks purely cosmetic.
+
+#### The attack this prevents
+
+Here is why the change was made, and it is worth spelling out because "use IDs,
+they are more permanent" sounds like housekeeping rather than security.
+
+The old claim named a repository **by a name that can be released.**
+
+1. You write a trust policy for `repo:acme/deployer:ref:refs/heads/main`. The
+   role can push images to your production registry.
+2. Time passes. The project is renamed, or archived and deleted, or the
+   organisation is restructured, or somebody transfers it. The name `acme/deployer`
+   becomes available.
+3. The trust policy is not updated, because nothing appeared to break. Nothing
+   *did* break: there is simply no longer anything using it.
+4. Somebody creates a repository at `acme/deployer`. On a personal account, this
+   requires only that the account name is available too, and account names are
+   released when accounts are deleted or renamed.
+5. They add a workflow with `permissions: id-token: write`, request an OIDC token
+   with audience `sts.amazonaws.com`, and present it to your account.
+6. **The claim matches.** AWS validates the token against GitHub's published
+   keys, which is correct: GitHub really did issue it. It checks the audience,
+   which is correct. It compares the subject, which is byte for byte the string
+   your policy trusts. It hands over credentials.
+
+At no point does anything malfunction. Every component behaves exactly as
+designed. The vulnerability lives entirely in the gap between "a name" and "the
+thing that had that name when I wrote this down".
+
+With immutable identifiers the attacker's repository has a different ID, because
+IDs are never reused, so their claim is a different string and `StringEquals`
+declines. The window closes not because the attack is detected but because it
+cannot be expressed.
+
+This is a real class of vulnerability rather than a hypothetical. It is the same
+shape as a dangling DNS record pointing at a released cloud resource, and it has
+the same character: nothing is broken, an identifier simply outlives the thing it
+identified.
+
+#### Why IDs are the stronger choice for this project specifically
+
+Chapter 3 exists to make one claim: *the cluster will not run an image unless it
+can prove that this repository's pipeline built it.* Every layer is built to
+resist an identifier being reinterpreted.
+
+- Section 24 rejected image tags in favour of digests, because a tag is a name
+  that can be repointed and a digest is the content.
+- Section 26 kept the registry immutable, so a tag cannot be reassigned even in
+  the registry that owns it.
+- The Kyverno policies pin an exact certificate subject rather than accepting any
+  signature, because "signed" is not the same as "signed by us".
+
+**Matching on repository names would have been the one place the project trusted
+a mutable label**, and it would have been the trust boundary that mattered most:
+the thing that decides who may push a signed image at all. A verified signature
+over a digest, produced by a pipeline whose AWS access is governed by a name
+anybody could later claim, is a very strong chain with its first link made of
+string.
+
+The IDs make the trust policy say what the rest of the chapter says: *this exact
+object, which has existed since a specific moment and can never be anything
+else*, rather than *whatever currently answers to this name*.
+
+#### What this does and does not buy
+
+Being precise, because the summaries of this change tend to blur two properties.
+
+**It buys unforgeability.** No other repository, now or ever, can produce this
+claim. That is the security property and it is the reason for the change.
+
+**It does not buy immunity from your own renames.** The names are still in the
+claim alongside the IDs, so renaming this repository changes the string and the
+trust policy stops matching until `github_repository` is updated in
+`terraform.tfvars`. That is a deliberate acceptance rather than an oversight: it
+fails closed, it fails immediately, and it fails in a way that is fixed by a
+reviewed Terraform change. A trust boundary that silently follows a rename is
+convenient in exactly the way this whole section argues against.
+
+An alternative exists. AWS now supports GitHub specific condition keys, including
+`repository_id`, `repository_owner_id` and `actor_id`, which can be matched
+independently of the subject. A policy conditioned on `repository_id` alone
+*would* survive a rename. It is deliberately not used here, for two reasons.
+First, the subject claim is what
+`sts:AssumeRoleWithWebIdentity` is actually about, and expressing the boundary in
+one condition that reads like a sentence is worth more than expressing it in
+three that have to be assembled. Second, matching `repository_id` without also
+pinning the ref would silently drop the branch restriction, and losing branch
+scoping to gain rename tolerance is a bad trade for a project whose pipeline
+signs artefacts.
+
+#### What was NOT changed, and why that took discipline
+
+The obvious reaction to "the identity format changed" is to update every place an
+identity appears. That would have broken things that were working.
+
+The Kyverno policies in [policies/](../policies/) pin this identity:
+
+```text
+https://github.com/clintonsenaye/secure-delivery-platform/.github/workflows/build-sign-attest.yml@refs/heads/main
+```
+
+with no numeric IDs in it, and they were left alone. **That is a different
+claim.** AWS validates `sub`. Fulcio builds the signing certificate's subject
+alternative name from `job_workflow_ref`, which is a URL and has always been a
+URL. The July 2026 change was to `sub`, so image verification was never affected
+by the failure that broke role assumption.
+
+Changing the policies to chase a format they do not use would have converted one
+broken thing into two, and the second would have been much harder to diagnose,
+because a signature verification failure and a signature *policy* typo produce
+the identical message: `no matching signatures`.
+
+Stated honestly: that is reasoning, not observation. This project has not yet
+produced a signature whose certificate could be read. The build workflow verifies
+its own output against a reconstructed identity before it commits anything, which
+is exactly the step that will catch it if the reasoning is wrong, and it will
+catch it in the pipeline rather than at admission time on a cluster.
 
 ### Three smaller things worth knowing
 
@@ -1663,9 +1892,9 @@ runs `terraform plan -lock=false`: acquiring the S3 native lock means writing a
 
 ### The stronger version, not built
 
-`sub: repo:owner/name:environment:production`, combined with a GitHub environment
-carrying protection rules, requires a human approval before the role can be
-assumed at all. It is one line and it is the correct production answer. It is not
+`sub: repo:OWNER@ID/NAME@ID:environment:production`, combined with a GitHub
+environment carrying protection rules, requires a human approval before the role
+can be assumed at all. It is one line and it is the correct production answer. It is not
 built here because a single operator approving their own deployments is ceremony
 rather than control.
 
@@ -1676,6 +1905,15 @@ rather than control.
 Written down deliberately, because an unlisted gap looks like an oversight and a
 listed one looks like a roadmap.
 
+- **Renaming this repository breaks deployments until Terraform is updated.**
+  The immutable IDs in the OIDC subject claim survive a rename, but the names
+  sitting beside them do not, so the claim changes and `StringEquals` stops
+  matching. It fails closed and it fails immediately, which is the right
+  direction, but it fails with the same unhelpful "not authorized to perform
+  sts:AssumeRoleWithWebIdentity" as everything else. The fix is one value in
+  `terraform.tfvars` and the diagnosis is in section 29. Accepted rather than
+  solved: the alternative, conditioning on `repository_id` instead of `sub`,
+  would drop the branch restriction unless it were rebuilt separately.
 - **No branch protection on `main`.** The single largest gap, and the one that
   most weakens the claim. The gate proves an image came from this pipeline; the
   pipeline builds whatever is on `main`. Requiring review before merge is what
