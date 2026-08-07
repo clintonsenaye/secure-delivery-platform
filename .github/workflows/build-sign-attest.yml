@@ -17,7 +17,7 @@
 #
 #   gate    scans. Runs on every pull request. Holds NO cloud credential at all.
 #   build   builds, pushes, signs, attests. Runs only on main.
-#   deploy  writes the digest into Git. Holds contents:write and nothing else.
+#   deploy  opens a PULL REQUEST recording the digest. Cannot merge it.
 #
 # Splitting them is not tidiness. A pull request run receives an OIDC subject
 # claim ending in `:pull_request`, and the IAM trust policy in
@@ -43,7 +43,19 @@
 #                                      `make apply ENV=ci`
 #   Repository variable AWS_REGION     optional, defaults to eu-west-2
 #
-# There is no repository SECRET. There is no AWS access key. That is the point.
+# THERE IS NO REPOSITORY SECRET. NOT ONE. That is not an accident and it is not
+# a gap: it is the property chapters 1 and 2 spent their whole length building,
+# and chapter 3 declined to spend it.
+#
+# There is no AWS access key, because JOB 2 proves its identity instead of
+# presenting one. There is no signing key, because JOB 2 signs keylessly. And
+# there is no token for the deploy job beyond the GITHUB_TOKEN GitHub mints for
+# the run, which expires with it.
+#
+# The cost of that last one is a manual step, explained at the end of JOB 3, and
+# it was chosen deliberately over storing a GitHub App private key. See
+# docs/architecture.md section 30 for the five options and why this is the right
+# one at this volume and the wrong one at scale.
 ##############################################################################
 
 name: build-sign-attest
@@ -52,17 +64,42 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      # THE LOOP GUARD.
+      # THE LOOP GUARD, AND IT IS NOW THE ONLY AUTOMATIC ONE. READ THIS BEFORE
+      # CHANGING THE LIST BELOW.
       #
-      # The deploy job below commits the new image digest into
-      # platform/manifests/. Without this, that commit triggers another build,
-      # which produces another digest, which triggers another build.
+      # The deploy job records the new image digest in platform/manifests/.
+      # Without this filter, that change reaching main triggers another build,
+      # which produces another digest, which triggers another build. The
+      # BUILD_TIME build argument means every rebuild produces different bytes
+      # and therefore a different digest, so the loop does not converge.
       #
-      # GitHub already declines to trigger workflows from a push made with
-      # GITHUB_TOKEN, so this is the second of two independent guards. Two,
-      # because the first one stops working silently the day someone swaps
-      # GITHUB_TOKEN for a personal access token or a GitHub App token to get
-      # past branch protection.
+      # This comment used to say there were two independent guards, the second
+      # being that GitHub does not trigger workflows from pushes made with
+      # GITHUB_TOKEN. THAT GUARD IS GONE. Since main became protected, the
+      # digest arrives by a pull request that a human merges, and a human merge
+      # triggers workflows exactly as it should.
+      #
+      # What still works: for a push to an existing branch GitHub takes a
+      # two-dot diff between the old and new tip, so merging a deploy pull
+      # request presents exactly one changed file, which is matched here, and no
+      # build starts. That holds for merge, squash and rebase merges alike,
+      # because the deploy branch always carries exactly one commit touching
+      # exactly this path.
+      #
+      # Where it fails open, both documented by GitHub: a push carrying more
+      # than 1,000 commits, and a diff that times out. Neither is reachable by
+      # this pipeline's own commits.
+      #
+      # The practical backstop is that every iteration of a runaway loop would
+      # need a human to merge a pull request, so it cannot run away unattended.
+      # IF AUTO-MERGE IS EVER ENABLED ON DEPLOY PULL REQUESTS, THAT BACKSTOP
+      # DISAPPEARS AND THIS NEEDS A SECOND, EXPLICIT GUARD.
+      #
+      # One related trap worth not tidying into existence: a workflow skipped by
+      # path filtering leaves its checks Pending, which blocks any pull request
+      # requiring them. The `pull_request` trigger below deliberately carries no
+      # path filter, which is why the gate always runs on a deploy pull request
+      # and can actually satisfy the required check.
       - 'platform/manifests/**'
       - 'docs/**'
       - 'evidence/**'
@@ -511,45 +548,87 @@ jobs:
   ##########################################################################
   # JOB 3: deploy
   #
-  # Writes the digest into Git. That is the entire job.
+  # Records the digest in Git by OPENING A PULL REQUEST. It does not push to
+  # main, and it cannot: main is protected.
   #
-  # NOTE WHAT IS ABSENT. There is no kubectl, no kubeconfig, no cluster
-  # endpoint and no inbound path to any cluster. Chapter 2's argument still
-  # holds in full: the pipeline does not deploy, it commits, and the cluster
-  # pulls. See docs/architecture.md section 17.
+  # WHY THIS JOB LOOKS THE WAY IT DOES.
   #
-  # The honest concession, which chapter 2 already made in rebuttal 4: this job
-  # holds write access to the default branch. Git write is far less privileged
-  # than cluster write, it is auditable in commit history, and it is
-  # constrainable with branch protection. Downgrading a credential is a real
-  # win even when it cannot be deleted.
+  # The first version pushed straight to main. That worked until branch
+  # protection was turned on, at which point every run failed with GH013,
+  # "Changes must be made through a pull request". The gap this closed was the
+  # largest one chapter 3 listed: the gate proves an image came from this
+  # pipeline, and the pipeline builds whatever is on main, so requiring review
+  # before merge is what makes "from this repository" mean anything.
+  #
+  # There were two ways to make the pipeline work again. One was to exempt it
+  # from the rule, by adding the Actions bot to the ruleset bypass list or by
+  # pointing ArgoCD at an unprotected branch. The other was to make it follow
+  # the rule, like a human. This is the second. The reasoning, and why the first
+  # two were rejected, is docs/architecture.md section 30.
+  #
+  # NOTE WHAT IS STILL ABSENT. No kubectl, no kubeconfig, no cluster endpoint,
+  # no inbound path to any cluster. Chapter 2's argument holds in full: the
+  # pipeline does not deploy, it proposes a commit, and the cluster pulls. See
+  # docs/architecture.md section 17.
+  #
+  # What HAS changed is the strength of the concession in chapter 2's rebuttal
+  # 4. That said the pipeline still needs Git write access to bump image tags,
+  # and consoled itself that Git write is auditable and constrainable with
+  # branch protection. It is now actually constrained: this job can create a
+  # branch and open a pull request, and it cannot merge one.
+  #
+  # THE TOKEN PROBLEM, WHICH IS THE NON OBVIOUS PART, AND THE MANUAL STEP.
+  #
+  # GitHub deliberately does not trigger workflows from events caused by
+  # GITHUB_TOKEN, to stop workflows recursing. That is the same behaviour this
+  # file relies on as a loop guard at the top. It also means a pull request
+  # opened with GITHUB_TOKEN never triggers the gate, so the required check sits
+  # at "Expected, waiting" and the pull request cannot be merged as it stands.
+  #
+  # THE FIX IS TWO CLICKS, NOT A CREDENTIAL. Closing and reopening the pull
+  # request produces a `reopened` event attributed to a person rather than to
+  # the token, the gate runs, and the pull request becomes mergeable. The last
+  # step of this job prints that instruction with the URL.
+  #
+  # The alternative was a GitHub App, whose installation token does trigger
+  # workflows, at the cost of storing its private key as a repository secret.
+  # That is what a team deploying many times a day should do. At one deploy every
+  # few days it is a poor trade: a permanent stored credential to save two
+  # clicks, in a project whose entire argument is that stored credentials are the
+  # thing to design away. All five options are set out in docs/architecture.md
+  # section 30.
   ##########################################################################
   deploy:
-    name: Record the digest in Git
+    name: Propose the digest as a pull request
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     permissions:
-      # The narrowest set that can do the job. No id-token, no packages, no
-      # attestations. This job cannot reach AWS at all.
+      # Enough to push a deploy/* branch and open a pull request against main.
+      # Deliberately NOT enough to merge one, and there is no id-token, so this
+      # job cannot reach AWS at all.
       contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: main
-          # A shallow clone cannot be rebased onto a moved main, which is what
-          # the retry loop below does when two merges land close together.
+          # Needed so the deploy branch can be rebased onto a main that moved
+          # while this run was building.
           fetch-depth: 0
+          # The default GITHUB_TOKEN, which is what the later git push
+          # authenticates with. It expires when the run ends and exists nowhere
+          # else.
           persist-credentials: true
 
       - name: Rewrite the deployment to the new digest
+        id: rewrite
         env:
           IMAGE: ${{ needs.build.outputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
-          TAG: ${{ needs.build.outputs.tag }}
         run: |
           set -euo pipefail
           command -v yq >/dev/null || {
@@ -576,28 +655,71 @@ jobs:
           yq '.spec.template.spec.containers[0].image' "$manifest"
           echo "::endgroup::"
 
-          # Sanity check. A tag reference here would silently undo the entire
-          # chapter, so it fails loudly instead.
+          # A tag reference here would silently undo the entire chapter.
           grep -q "@sha256:" "$manifest" || {
             echo "deployment.yaml does not reference an image by digest. Refusing to commit."
             exit 1
           }
 
-      - name: Commit and push
+          # THE CLEAN NO-OP. Unchanged behaviour from the push based version:
+          # a rebuild that resolves to the digest already deployed is success,
+          # not failure, and must not open an empty pull request.
+          if git diff --quiet -- platform/manifests/; then
+            echo "Digest unchanged. Nothing to propose."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      ####################################################################
+      # Reuse an open deploy pull request rather than stacking a second one.
+      #
+      # Matching is on the head branch prefix rather than on a label, because a
+      # label would have to be created first and that needs a wider permission
+      # than this job otherwise wants.
+      #
+      # Reusing means the deploy branch always holds exactly ONE commit on top
+      # of current main, carrying the current digest. Superseding a digest that
+      # was never merged is the normal case: builds are faster than reviews.
+      ####################################################################
+      - name: Find an open deploy pull request
+        id: find
+        if: steps.rewrite.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          existing=$(gh pr list --state open --base main \
+            --json number,headRefName,url \
+            --jq '[.[] | select(.headRefName | startswith("deploy/"))][0] // empty')
+
+          if [ -n "$existing" ]; then
+            number=$(echo "$existing" | jq -r '.number')
+            branch=$(echo "$existing" | jq -r '.headRefName')
+            echo "Reusing open deploy pull request #${number} on ${branch}."
+            echo "number=${number}" >> "$GITHUB_OUTPUT"
+          else
+            branch="deploy/${TAG}"
+            echo "No open deploy pull request. Will create ${branch}."
+            echo "number=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push the deploy branch
+        if: steps.rewrite.outputs.changed == 'true'
         env:
           IMAGE: ${{ needs.build.outputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
           TAG: ${{ needs.build.outputs.tag }}
+          BRANCH: ${{ steps.find.outputs.branch }}
         run: |
           set -euo pipefail
 
-          if git diff --quiet -- platform/manifests/; then
-            echo "Digest unchanged. Nothing to commit."
-            exit 0
-          fi
-
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch --create "$BRANCH"
 
           # The body is built with printf rather than a heredoc, because a
           # heredoc inside an indented YAML block needs its terminator at column
@@ -608,34 +730,233 @@ jobs:
             "source: ${GITHUB_SHA}" \
             "run:    ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             "" \
-            "Deployed by digest, never by tag. ArgoCD picks this up on its next" \
-            "reconciliation and Kyverno verifies the signature at admission.")
+            "Deployed by digest, never by tag. Once merged, ArgoCD picks this up" \
+            "on its next reconciliation and Kyverno verifies the signature at" \
+            "admission before a pod is scheduled.")
 
           git add platform/manifests/demo-app/deployment.yaml
           git commit --message "deploy: demo-app ${TAG}" --message "${body}"
 
-          # Rebase and retry, because concurrency groups serialise runs on the
-          # same ref but not merges arriving between them.
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              echo "Pushed on attempt ${attempt}."
-              exit 0
+          # Give --force-with-lease something to compare against when the branch
+          # already exists remotely. Without a remote-tracking ref it refuses
+          # with "stale info", which the classifier below treats as a race.
+          git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null || true
+
+          ##############################################################
+          # PUSH, WITH FAILURES CLASSIFIED RATHER THAN COUNTED.
+          #
+          # The previous version retried three times on ANY failure and
+          # rebased between attempts. That is right for exactly one cause,
+          # a concurrent merge, and wrong for every other. When branch
+          # protection started refusing the push, it produced three
+          # identical GH013 errors and a closing line about rebasing, which
+          # actively pointed the reader away from the cause.
+          #
+          # A rule violation is a statement about what you are allowed to
+          # do. It does not become true on the third attempt, and rebasing
+          # cannot make it true. Retrying it wastes time and, worse, buries
+          # the one useful line of output under two copies of itself.
+          #
+          # So: races are retried, refusals fail immediately with an
+          # explanation, and anything unrecognised fails immediately rather
+          # than being retried hopefully.
+          ##############################################################
+          attempt=1
+          max_attempts=3
+
+          while : ; do
+            if push_output=$(git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}" 2>&1); then
+              echo "$push_output"
+              echo "Pushed ${BRANCH} on attempt ${attempt}."
+              break
             fi
-            echo "Push rejected, rebasing onto main and retrying."
-            git pull --rebase origin main
+
+            echo "$push_output"
+
+            case "$push_output" in
+              *GH013*|*"protected branch"*|*"Protected branch update failed"*|*"Changes must be made through a pull request"*|*"required status check"*|*"review is required"*)
+                echo "::error title=Push refused by a repository rule::Branch protection rejected the push. This is terminal."
+                echo ""
+                echo "A ruleset refusal is not a race, and rebasing cannot resolve it."
+                echo "Not retrying."
+                echo ""
+                echo "This job pushes to a deploy/* branch and opens a pull request;"
+                echo "it never pushes to main. If a rule is refusing THAT push, the"
+                echo "ruleset covers more refs than intended. Check whether its"
+                echo "target pattern is something like ** rather than main, and"
+                echo "whether it excludes deploy/*."
+                exit 1
+                ;;
+
+              *"Authentication failed"*|*"could not read Username"*|*"remote: Permission"*|*"403 Forbidden"*)
+                echo "::error title=Push rejected on credentials::The token could not write to this repository. This is terminal."
+                echo ""
+                echo "The workflow permissions block above grants contents: write,"
+                echo "so a failure here usually means an organisation policy or a"
+                echo "ruleset overrides it for this ref."
+                exit 1
+                ;;
+
+              *"non-fast-forward"*|*"fetch first"*|*"stale info"*|*"cannot lock ref"*|*"failed to lock"*)
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "::error title=Lost the race ${max_attempts} times::main kept moving underneath this run."
+                  echo "Re-run the job. This is genuinely transient."
+                  exit 1
+                fi
+                echo "Concurrent update detected. Rebasing onto main and retrying."
+                git fetch origin main
+                git rebase origin/main || {
+                  echo "::error title=Rebase failed::The digest rewrite conflicts with main."
+                  echo "That should be impossible for a single generated line, so"
+                  echo "something else is editing the image reference by hand."
+                  exit 1
+                }
+                git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null || true
+                attempt=$((attempt + 1))
+                continue
+                ;;
+
+              *)
+                echo "::error title=Unrecognised push failure::Not retrying."
+                echo ""
+                echo "The output above is the whole of what git said. It was not"
+                echo "recognised as either a rule refusal or a race, and retrying"
+                echo "an unknown failure just produces the same message three"
+                echo "times. If this turns out to be transient, add its signature"
+                echo "to the race branch of the classifier in this file."
+                exit 1
+                ;;
+            esac
           done
 
-          echo "Could not push after three attempts."
-          exit 1
+      - name: Open or update the pull request
+        id: pr
+        if: steps.rewrite.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAG: ${{ needs.build.outputs.tag }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+          PR_NUMBER: ${{ steps.find.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          title="deploy: demo-app ${TAG}"
+
+          body=$(printf '%s\n' \
+            "Records the digest of a signed image so ArgoCD deploys it." \
+            "" \
+            "| | |" \
+            "|---|---|" \
+            "| image | \`${IMAGE}@${DIGEST}\` |" \
+            "| tag | \`${TAG}\` |" \
+            "| digest | \`${DIGEST}\` |" \
+            "| source commit | ${GITHUB_SHA} |" \
+            "| build run | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |" \
+            "" \
+            "The image was scanned, signed with a keyless Cosign signature, and" \
+            "attested with a CycloneDX SBOM and SLSA build provenance. The build" \
+            "job verified all three against this repository's workflow identity" \
+            "before opening this pull request." \
+            "" \
+            "**Deployed by digest, never by tag.** On merge, ArgoCD reconciles" \
+            "within about 30 seconds and Kyverno verifies the signature at" \
+            "admission before a pod is scheduled. Verify independently with:" \
+            "" \
+            "\`\`\`bash" \
+            "make ci-config   # prints the certificate identity to paste below" \
+            "" \
+            "cosign verify \\" \
+            "  --certificate-identity=\"<identity from make ci-config>\" \\" \
+            "  --certificate-oidc-issuer=\"https://token.actions.githubusercontent.com\" \\" \
+            "  ${IMAGE}@${DIGEST}" \
+            "\`\`\`" \
+            "" \
+            "Opened automatically. It goes through review like any other change:" \
+            "the delivery automation follows the same branch protection rule a" \
+            "human does rather than being exempted from it. See" \
+            "docs/architecture.md section 30.")
+
+          if [ -n "${PR_NUMBER}" ]; then
+            gh pr edit "${PR_NUMBER}" --title "${title}" --body "${body}"
+            url=$(gh pr view "${PR_NUMBER}" --json url --jq '.url')
+            echo "Updated pull request #${PR_NUMBER}: ${url}"
+            echo "action=updated" >> "$GITHUB_OUTPUT"
+          else
+            url=$(gh pr create --base main --head "${BRANCH}" \
+              --title "${title}" --body "${body}")
+            echo "Opened ${url}"
+            echo "action=opened" >> "$GITHUB_OUTPUT"
+          fi
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      ####################################################################
+      # THE MANUAL STEP. This is the normal path, not a degraded one.
+      #
+      # GitHub does not trigger workflows from events caused by GITHUB_TOKEN,
+      # so the gate has not started on the pull request just opened and will
+      # not start on its own. Reopening it produces an event attributed to a
+      # person, which does trigger it.
+      #
+      # This job could have avoided the manual step by opening the pull request
+      # as a GitHub App, at the cost of storing the App's private key as a
+      # repository secret. That trade was declined: see docs/architecture.md
+      # section 30. So the instruction is printed clearly, with the URL, every
+      # time, rather than being something to remember.
+      ####################################################################
+      - name: What to do next
+        if: steps.rewrite.outputs.changed == 'true'
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Two clicks to finish this deploy"
+            echo
+            echo "**${PR_URL}**"
+            echo
+            echo "The **Secret and vulnerability gate** check has not started on"
+            echo "that pull request, and will not start on its own. GitHub does"
+            echo "not trigger workflows from events caused by \`GITHUB_TOKEN\`,"
+            echo "which is what opened it."
+            echo
+            echo "**Close the pull request, then reopen it.** The reopen event"
+            echo "comes from you rather than from the token, the gate runs, and"
+            echo "the pull request becomes mergeable. Review the diff and merge."
+            echo
+            echo "This is deliberate. The alternative was storing a GitHub App"
+            echo "private key so the automation could trigger its own checks."
+            echo "At this deploy volume, two clicks is a better trade than a"
+            echo "permanent stored credential in a project whose whole argument"
+            echo "is that stored credentials are the thing to design away."
+            echo "See \`docs/architecture.md\` section 30."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=Close and reopen the pull request to run the gate::${PR_URL}"
 
       - name: Summary
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           {
-            echo "### Committed to main"
-            echo
-            echo "ArgoCD reconciles every 30 seconds, so the new digest reaches"
-            echo "the cluster shortly. Kyverno verifies the signature at"
-            echo "admission before a single pod is scheduled."
-            echo
-            echo "    make argocd-status"
+            if [ "${{ steps.rewrite.outputs.changed }}" != "true" ]; then
+              echo "### No change"
+              echo
+              echo "The manifest already references \`${DIGEST}\`."
+              echo "Nothing to propose, and that is success rather than failure."
+            else
+              echo
+              echo "---"
+              echo
+              echo "Deploy pull request ${{ steps.pr.outputs.action }} for"
+              echo "\`${IMAGE}@${DIGEST}\`"
+              echo
+              echo "This pipeline does not deploy. It proposes a commit, a human"
+              echo "merges it, and the cluster pulls. **It holds no stored"
+              echo "credential of any kind**: no AWS access key, no signing key,"
+              echo "no App key, and a GITHUB_TOKEN that expires with this run and"
+              echo "cannot write to \`main\`."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

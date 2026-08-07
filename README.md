@@ -141,7 +141,8 @@ That means a fresh clone needs the pipeline to have run at least once:
 ```bash
 make apply ENV=ci    # ECR, the GitHub OIDC provider and two IAM roles, ~$0.01/month
 make ci-config       # prints the GitHub repository variables to set
-# push to main, let the workflow finish, then:
+# push to main; the workflow builds and signs the image, then opens a
+# pull request recording the digest. Review and merge it, then:
 git pull
 make up && make argocd-up
 ```
@@ -251,11 +252,27 @@ make apply ENV=ci
 make ci-config          # prints the GitHub repository variables to set
 ```
 
-`make ci-config` prints four repository **variables**, and no secrets, because
-there are none to set. It also prints the exact Cosign certificate identity that
-must appear in both files under [policies/](policies/). A mismatch there produces
-`no matching signatures`, which reads like a signing failure and is a policy
-typo, so diff them rather than eyeballing them.
+`make ci-config` prints the repository **variables** to set, plus the exact
+Cosign certificate identity that must appear in both files under
+[policies/](policies/). A mismatch there produces `no matching signatures`, which
+reads like a signing failure and is a policy typo, so diff them rather than
+eyeballing them.
+
+**There are no repository secrets to set. Not one.** No AWS access key, because
+the pipeline proves its identity rather than presenting one. No signing key,
+because signing is keyless. No token for the deploy job beyond the `GITHUB_TOKEN`
+GitHub mints for the run.
+
+That last one has a visible cost. Because `main` is protected, the pipeline opens
+a pull request rather than pushing the digest, and GitHub does not trigger
+workflows from events caused by `GITHUB_TOKEN`, so the pull request's own
+required check never starts. **Close the pull request and reopen it**: the reopen
+event comes from you, the gate runs, and it becomes mergeable. The pipeline
+prints that instruction with the URL every time.
+
+Two clicks per deploy, in exchange for a project with zero stored credentials.
+[Section 30](docs/architecture.md) sets out all five ways to solve this and why
+this is the right one at this volume and the wrong one at scale.
 
 **Configure the dev environment:**
 
@@ -473,27 +490,51 @@ now reports the digest that was signed and verified at admission.
 > The manifests are in Git and provably so. The image bytes are not. They came
 > from a laptop and nothing verifies them.
 
-**The gaps chapter 3 leaves**, listed in full in
-[section 30](docs/architecture.md). The largest is that **there is no branch
-protection on `main`**. The gate proves an image came from this pipeline; the
-pipeline builds whatever is on `main`. Requiring review before merge is what
-makes "from this repository" mean something, it costs nothing, and it is the
-first thing to fix.
+**The gap chapter 3 closed on itself.** The largest item on its own gap list was
+that `main` had no branch protection: the gate proves an image came from this
+pipeline, and the pipeline builds whatever is on `main`. Protection is now on,
+and turning it on **immediately broke the delivery pipeline**, which pushed the
+digest straight to `main` and was refused with `GH013`.
 
-### Two limits worth knowing before you read the code
+The fix was to make the automation follow the same rule a human does. The deploy
+job now opens a pull request rather than pushing, and it cannot merge one. Two
+alternatives were rejected: adding Actions to the ruleset bypass list, which
+would exempt the one actor whose commits actually reach the cluster from the one
+control that reviews what reaches it; and pointing ArgoCD at an unprotected
+branch, which protects the branch nobody deploys from. That is written up in full
+in [section 30](docs/architecture.md).
+
+**The gaps chapter 3 leaves** are listed in
+[section 31](docs/architecture.md).
+
+### Three limits worth knowing before you read the code
 
 **A signed backdoor is still signed.** These policies prove origin and integrity.
 They say nothing about whether the code is any good. Provenance is not quality,
-and anyone who can merge to `main` can get anything signed.
+and anyone who can merge to `main` can still get anything signed. Branch
+protection means the strength of every signature here is now the strength of the
+review on the pull request that produced it.
 
 **The gate can be turned off by deleting a file.** Prune is on, so removing
-`policies/require-signed-images.yaml` in a one line pull request removes the
-policy from the cluster. Nothing stops serving, no alert fires, and every
-Application still reports Synced and Healthy. That is a process problem wearing a
-technical costume, and it is why branch protection is the top of the gap list
-rather than a footnote.
+`policies/require-signed-images.yaml` removes the policy from the cluster.
+Nothing stops serving, no alert fires, and every Application still reports Synced
+and Healthy. That is a process problem wearing a technical costume, and branch
+protection is what turns it from a one line push into a reviewed change.
 
-The other sixteen limits are in
+**Chapter 3 still stores no credentials, and that was nearly lost.** Chapter 2's
+credential table had three rows and said in bold there was no fourth. It now has
+seven, but every one added by chapter 3 is minted per job and expires with it.
+The only stored secret in the project is the 12 hour ECR pull token, and it
+exists purely because this runs on kind rather than EKS.
+
+The obvious fix for the branch protection problem was a GitHub App, which would
+have meant a permanent private key in repository secrets. It was declined for two
+clicks per deploy. **A pipeline that signs container images, pushes to a private
+registry and commits to a protected branch, with zero secrets configured**, is
+the strongest single thing here. The full table is in
+[section 27](docs/architecture.md).
+
+The other limits are in
 [docs/architecture.md section 28](docs/architecture.md).
 
 ---
