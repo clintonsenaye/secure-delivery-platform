@@ -78,7 +78,7 @@ spec:
               # mechanism, and it is the wrong scope for a real platform, where
               # the pattern is to enforce cluster wide and carve out the handful
               # of namespaces that genuinely cannot comply. Listed as a known gap
-              # in docs/architecture.md section 31.
+              # in docs/architecture.md section 32.
               namespaces:
                 - demo
 
@@ -217,6 +217,21 @@ spec:
                     rekor:
                       url: https://rekor.sigstore.dev
 
-      # Enforce, not Audit. The rule level field, which replaced the deprecated
-      # spec.validationFailureAction.
-      failureAction: Enforce
+          # DENY, NOT AUDIT.
+          #
+          # NOTE THE NESTING. This belongs to the verifyImages ENTRY, not to the
+          # rule. Written one level out, at `spec.rules[].failureAction`, the API
+          # server rejects the whole policy with
+          #
+          #   .spec.rules[0].failureAction: field not declared in schema
+          #
+          # and ArgoCD reports the application Missing while the workload it was
+          # supposed to gate starts perfectly happily. That is exactly what
+          # happened, and docs/architecture.md section 31 is about why that
+          # failure mode is worse than a policy that merely refuses everything.
+          #
+          # `failureAction` has lived here since Kyverno v1.13 at least; it has
+          # never existed at rule level in any published chart. It replaced the
+          # deprecated `spec.validationFailureAction`, which still exists and
+          # still works, and which is NOT what this uses.
+          failureAction: Enforce

@@ -96,11 +96,13 @@ else
 endif
 
 .PHONY: help up down status plan apply destroy bootstrap init fmt validate lint \
-        lint-tf lint-ansible lint-yaml scan scan-checkov scan-trivy kubeconfig \
+        lint-tf lint-ansible lint-yaml lint-policies scan scan-checkov scan-trivy \
+        kubeconfig \
         cost check-env check-tools clean \
         argocd-up argocd-down argocd-ui argocd-password argocd-status \
         demo-ui check-cluster \
-        ci-config ecr-login kyverno-status verify-running-image supply-chain-status
+        ci-config ecr-login kyverno-status check-policies verify-running-image \
+        supply-chain-status
 
 ##############################################################################
 # Help
@@ -119,7 +121,7 @@ help: ## Show this help
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-16s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Supply chain, chapter 3 (free on kind)$(RESET)"
-	@grep -E '^(ci-config|ecr-login|kyverno-status|verify-running-image|supply-chain-status):.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -E '^(ci-config|ecr-login|kyverno-status|check-policies|verify-running-image|supply-chain-status):.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)AWS$(RESET)"
@@ -131,7 +133,7 @@ help: ## Show this help
 	@echo "  no cluster, and meant to be left up. ENV=dev is the expensive one."
 	@echo ""
 	@echo "$(BOLD)Quality$(RESET)"
-	@grep -E '^(lint|lint-tf|lint-ansible|lint-yaml|scan|scan-checkov|scan-trivy|fmt|validate):.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -E '^(lint|lint-tf|lint-ansible|lint-yaml|lint-policies|scan|scan-checkov|scan-trivy|fmt|validate):.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  ENV defaults to $(BOLD)dev$(RESET). Example: make plan ENV=prod"
@@ -248,7 +250,27 @@ argocd-up: check-cluster ## Install ArgoCD and bootstrap the root app
 	@$(MAKE) --no-print-directory ecr-login || \
 	  echo "$(AMBER)ECR login skipped. Run 'make ecr-login' once AWS credentials are available.$(RESET)"
 	@echo ""
-	@echo "$(GREEN)ArgoCD is running and the root app is applied.$(RESET)"
+	@echo "$(BOLD)==> Waiting for the admission gate to install$(RESET)"
+	@echo "Sync wave -1 applies the ClusterPolicies. This target FAILS if they do"
+	@echo "not arrive, because a workload running with no gate in front of it looks"
+	@echo "exactly like a workload running with a gate that is passing."
+	@expected=$$(ls $(POLICY_DIR)/*.yaml 2>/dev/null | wc -l | tr -d ' '); \
+	 for i in $$(seq 1 36); do \
+	   found=$$($(KUBECTL) get clusterpolicy -o name 2>/dev/null | wc -l | tr -d ' '); \
+	   if [ "$$found" -ge "$$expected" ]; then break; fi; \
+	   sleep 5; \
+	 done
+	@$(MAKE) --no-print-directory check-policies || { \
+	  echo ""; \
+	  echo "$(RED)Refusing to report success.$(RESET) ArgoCD may say Synced and Healthy"; \
+	  echo "for everything else while the gate is absent. Check the policies"; \
+	  echo "application before using this cluster for anything:"; \
+	  echo ""; \
+	  echo "  $(KUBECTL) get application kyverno-policies -n $(ARGOCD_NS) \\"; \
+	  echo "    -o jsonpath='{.status.conditions[*].message}{"\\n"}'"; \
+	  exit 1; }
+	@echo ""
+	@echo "$(GREEN)ArgoCD is running, the root app is applied, and the gate is enforcing.$(RESET)"
 	@echo ""
 	@echo "  make argocd-status         sync and health of every app"
 	@echo "  make supply-chain-status   policies, and what is actually running"
@@ -453,6 +475,66 @@ ecr-login: check-cluster ## Refresh the 12 hour ECR credential in the demo and k
 	@echo ""
 	@echo "$(GREEN)ECR credential refreshed.$(RESET)"
 
+check-policies: check-cluster ## Fail loudly if the admission gate is not actually installed
+	@##########################################################################
+	@# THIS TARGET EXISTS BECAUSE OF A REAL INCIDENT. See architecture.md 31.
+	@#
+	@# Both ClusterPolicies were rejected by the API server for a schema error,
+	@# ArgoCD reported the application Missing, and the demo workload started
+	@# anyway with no admission control in front of it at all.
+	@#
+	@# Nothing looked wrong. The pods were Running, the demo app served traffic,
+	@# and `kubectl get pods` was entirely green. A gate that is absent and a
+	@# gate that is passing produce the identical observation from every angle
+	@# except the one nobody thinks to check: whether the gate is there.
+	@##########################################################################
+	@if ! $(KUBECTL) get crd clusterpolicies.kyverno.io >/dev/null 2>&1; then \
+	  echo "$(RED)FAIL: Kyverno is not installed.$(RESET) The ClusterPolicy CRD does not exist."; \
+	  echo ""; \
+	  echo "Nothing is verifying image signatures. Anything that can be pulled can run."; \
+	  echo ""; \
+	  echo "  $(KUBECTL) get application kyverno -n $(ARGOCD_NS)"; \
+	  exit 1; \
+	fi
+	@expected=$$(ls $(POLICY_DIR)/*.yaml 2>/dev/null | wc -l | tr -d ' '); \
+	 found=$$($(KUBECTL) get clusterpolicy -o name 2>/dev/null | wc -l | tr -d ' '); \
+	 if [ "$$found" -eq 0 ]; then \
+	   echo "$(RED)FAIL: NO ADMISSION POLICIES ARE INSTALLED.$(RESET)"; \
+	   echo ""; \
+	   echo "$(POLICY_DIR)/ holds $$expected policies and the cluster has none."; \
+	   echo "Every workload in the $(DEMO_NS) namespace is running unverified."; \
+	   echo ""; \
+	   echo "$(AMBER)This is worse than the gate rejecting everything, because it$(RESET)"; \
+	   echo "$(AMBER)looks exactly like the gate passing everything.$(RESET)"; \
+	   echo ""; \
+	   echo "Most likely the policies failed to apply. ArgoCD keeps the reason:"; \
+	   echo ""; \
+	   echo "  $(KUBECTL) get application kyverno-policies -n $(ARGOCD_NS) \\"; \
+	   echo "    -o jsonpath='{.status.conditions[*].message}{\"\\n\"}'"; \
+	   exit 1; \
+	 fi; \
+	 if [ "$$found" -lt "$$expected" ]; then \
+	   echo "$(RED)FAIL: only $$found of $$expected policies are installed.$(RESET)"; \
+	   echo "A partially applied gate is not a gate. Missing:"; \
+	   for f in $(POLICY_DIR)/*.yaml; do \
+	     n=$$(basename "$$f" .yaml); \
+	     $(KUBECTL) get clusterpolicy "$$n" >/dev/null 2>&1 || echo "  $$n"; \
+	   done; \
+	   exit 1; \
+	 fi; \
+	 notready=$$($(KUBECTL) get clusterpolicy \
+	   -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}' 2>/dev/null \
+	   | tr ' ' '\n' | grep -v '=True$$' | grep -v '^$$' || true); \
+	 if [ -n "$$notready" ]; then \
+	   echo "$(RED)FAIL: policies exist but are not Ready.$(RESET)"; \
+	   echo "$$notready" | sed 's/^/  /'; \
+	   echo ""; \
+	   echo "A ClusterPolicy that is present but not Ready is not enforcing."; \
+	   echo "  $(KUBECTL) describe clusterpolicy"; \
+	   exit 1; \
+	 fi; \
+	 echo "$(GREEN)Admission gate installed: $$found of $$expected policies, all Ready.$(RESET)"
+
 kyverno-status: check-cluster ## Show the installed policies and their enforcement mode
 	@echo ""
 	@echo "$(BOLD)Cluster policies$(RESET)"
@@ -470,6 +552,8 @@ kyverno-status: check-cluster ## Show the installed policies and their enforceme
 	@echo ""
 	@echo "$(BOLD)Recent policy decisions$(RESET)"
 	@$(KUBECTL) get events -n $(DEMO_NS) --sort-by=.lastTimestamp 2>/dev/null | tail -12 || true
+	@echo ""
+	@$(MAKE) --no-print-directory check-policies
 	@echo ""
 
 verify-running-image: check-cluster ## Verify the signature of the image the cluster is actually running
@@ -666,7 +750,7 @@ cost: ## Print the running cost estimate
 # Quality gates
 ##############################################################################
 
-lint: lint-tf lint-yaml lint-ansible scan ## Run every check
+lint: lint-tf lint-yaml lint-ansible lint-policies scan ## Run every check
 	@echo ""
 	@echo "$(GREEN)All available checks passed.$(RESET)"
 
@@ -702,6 +786,37 @@ lint-yaml: ## yamllint over Ansible, kind, platform, policies and workflows
 	  yamllint -c .yamllint.yml ansible/ kind/ platform/ policies/ .github/; \
 	else \
 	  echo "$(AMBER)SKIPPED: yamllint not installed.$(RESET)  pip install yamllint"; \
+	fi
+
+lint-policies: ## Validate policies/ against the live Kyverno API (server-side dry run)
+	@echo "$(BOLD)==> kubectl apply --dry-run=server over $(POLICY_DIR)/$(RESET)"
+	@##########################################################################
+	@# THE CHECK THAT WOULD HAVE CAUGHT IT. See architecture.md section 31.
+	@#
+	@# Both policies once shipped with `failureAction` one nesting level too
+	@# high. Offline schema validation passed, because the validator only
+	@# rejected unknown fields at the top level of the document. The API server
+	@# does not have that weakness: it decodes strictly, at every depth, using
+	@# the CRD the running Kyverno actually installed.
+	@#
+	@# So the authoritative check is not a schema file downloaded from a release
+	@# tag. It is asking the cluster that will run the policy.
+	@##########################################################################
+	@if ! command -v kubectl >/dev/null 2>&1; then \
+	  echo "$(AMBER)SKIPPED: kubectl not installed.$(RESET)"; \
+	elif ! $(KUBECTL) cluster-info >/dev/null 2>&1; then \
+	  echo "$(AMBER)SKIPPED: no cluster on context kind-$(KIND_CLUSTER).$(RESET)"; \
+	  echo "  This check needs a running Kyverno to validate against. make up && make argocd-up"; \
+	elif ! $(KUBECTL) get crd clusterpolicies.kyverno.io >/dev/null 2>&1; then \
+	  echo "$(AMBER)SKIPPED: Kyverno is not installed on this cluster.$(RESET)"; \
+	  echo "  The CRD is what defines the schema, so there is nothing to validate against."; \
+	else \
+	  $(KUBECTL) apply --dry-run=server -f $(POLICY_DIR)/ || { \
+	    echo ""; \
+	    echo "$(RED)A policy was rejected by the API server.$(RESET)"; \
+	    echo "It would fail to apply, ArgoCD would report the application Missing,"; \
+	    echo "and the workload it gates would start with no admission control."; \
+	    exit 1; }; \
 	fi
 
 lint-ansible: ## ansible-lint over the playbook and role
