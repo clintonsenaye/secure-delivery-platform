@@ -78,7 +78,7 @@ spec:
               # mechanism, and it is the wrong scope for a real platform, where
               # the pattern is to enforce cluster wide and carve out the handful
               # of namespaces that genuinely cannot comply. Listed as a known gap
-              # in docs/architecture.md section 30.
+              # in docs/architecture.md section 31.
               namespaces:
                 - demo
 

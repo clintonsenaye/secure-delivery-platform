@@ -99,8 +99,9 @@ spec:
           # THIS LINE IS CHAPTER 3.
           #
           # It is written by .github/workflows/build-sign-attest.yml, which
-          # commits it here after the image has been built, scanned, attested
-          # and signed. Nothing else edits it, and nothing should.
+          # PROPOSES this value, in a pull request, after the image has been
+          # built, scanned, attested, signed and verified. A human merges it.
+          # Nothing else edits this line, and nothing should.
           #
           # BY DIGEST, NEVER BY TAG. The whole chapter is in that distinction.
           #

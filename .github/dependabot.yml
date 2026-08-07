@@ -72,7 +72,7 @@ updates:
   # for example golang:1.25-alpine to golang:1.26-alpine. It cannot pin those
   # bases by digest, and this project does not either, which is an inconsistency
   # with everything else in chapter 3 and is listed as a gap in
-  # docs/architecture.md section 30 rather than defended.
+  # docs/architecture.md section 31 rather than defended.
   - package-ecosystem: docker
     directory: /app/src
     schedule:

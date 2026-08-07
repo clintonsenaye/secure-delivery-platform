@@ -656,7 +656,10 @@ match it.**
 Three consequences follow, and they are the whole point:
 
 1. **You never deploy.** There is no deploy command, no deploy button and no
-   deploy job. You commit. The cluster catches up on its own.
+   deploy job. You commit. The cluster catches up on its own. (Chapter 3 adds a
+   review step in front of that commit, because `main` became protected. It does
+   not add a deploy step: the pipeline proposes a change, a human merges it, and
+   the cluster still pulls. Section 30.)
 2. **The cluster's state is a pure function of a commit.** Not "roughly
    corresponds to", not "was deployed from, plus whatever people did since".
    Drift is detected and undone.
@@ -781,10 +784,14 @@ Every one of these is a fair hit.
    topology where each cluster runs something that pulls. Raise this before
    someone raises it at you.
 
-4. **"Chapter 3 still needs Git write access to bump image tags."** True. But Git
-   write is enormously less privileged than cluster write, it is auditable in
-   commit history, and it is constrainable with branch protection and required
-   review. Downgrading a credential is a real win even when you cannot delete it.
+4. **"Chapter 3 still needs Git write access to bump image tags."** True when
+   this was written, and largely answered since. Git write is enormously less
+   privileged than cluster write, it is auditable in commit history, and it is
+   constrainable with branch protection and required review. **Chapter 3 went on
+   to actually constrain it**: `main` is protected, and the pipeline's token can
+   push a `deploy/*` branch and open a pull request but cannot merge one or write
+   to `main`. Section 30. Downgrading a credential is a real win even when you
+   cannot delete it, and this one got downgraded twice.
 
 5. **"Self-heal means you cannot hotfix during an incident."** True, and it is
    the point. The documented escape hatch is
@@ -1441,13 +1448,41 @@ table bought.
 | 3 | ArgoCD admin password | A Secret, read once | Log into ArgoCD | Until changed |
 | 4 | **GitHub Actions OIDC token** | GitHub, per job | Be exchanged for the AWS role, and obtain a Fulcio certificate | ~15 minutes |
 | 5 | **AWS STS session** | The runner, in memory | Push to **one** ECR repository | 1 hour, never stored |
-| 6 | **`GITHUB_TOKEN`, `contents: write`** | GitHub, per job | Commit to this repository | The job |
+| 6 | **`GITHUB_TOKEN`, `contents` and `pull-requests: write`** | GitHub, per job | Push a `deploy/*` branch and open a pull request. **Cannot merge one, and cannot write to `main`** | The job |
 | 7 | **ECR pull secret in `demo` and `kyverno`** | **The kind cluster** | Pull images and read signatures from ECR | **12 hours, refreshed by hand** |
 | - | **The Cosign signing key** | **nobody** | | **does not exist** |
 
-Rows 4, 5 and 6 are short lived by construction and none of them is stored
-anywhere a human could copy. **Row 7 is the only genuine stored secret, and it
-exists purely because this runs on kind.**
+**There is no eighth row, and in particular there is no repository secret.**
+
+That is worth dwelling on, because it was nearly lost. Rows 4, 5 and 6 are minted
+per job by GitHub and expire with the run; none of them is stored anywhere a
+human could copy, and none can be pasted into a settings page. **Row 7 is the
+only genuine stored secret in the entire project, and it exists purely because
+this runs on kind.**
+
+Chapter 3 came within one design decision of adding a permanent one. Branch
+protection made the delivery automation open a pull request, and GitHub will not
+trigger checks on a pull request opened with `GITHUB_TOKEN`, so the required
+check could never pass on its own. The obvious fix was a GitHub App, whose
+installation token does trigger workflows, at the price of storing its private
+key as a repository secret forever.
+
+**That trade was declined.** The pull request is opened with `GITHUB_TOKEN` and a
+human closes and reopens it, which takes two clicks and triggers the gate under
+their own identity. Section 30 sets out all five options and why this one is
+right at this volume and wrong at scale.
+
+The result is that chapter 2's claim survives chapter 3 intact rather than with
+an asterisk: **nothing outside the cluster holds a credential that can write to
+it, and nothing in this repository holds a stored credential at all.** A build
+pipeline that signs container images, pushes to a private registry and commits to
+a protected branch, with zero secrets configured, is the strongest single thing
+this project can point at.
+
+Note what row 6 no longer says either. Before branch protection it read "Commit
+to this repository", meaning `main`. It now cannot write to `main` at all. That
+is a credential downgrade achieved by a control outside this repository, which is
+the most durable kind.
 
 On EKS, row 7 disappears entirely. The kubelet pulls from ECR using the node's
 instance role, which is why section 8 could say Deployments have no
@@ -1489,8 +1524,10 @@ reviewer will reach for.
 
 2. **Anyone who can merge to `main` can get anything signed.** The pipeline signs
    whatever is in the repository. The security boundary has **moved** to branch
-   protection and code review, not disappeared. This repository currently has no
-   branch protection, which is a gap listed in section 30 rather than hidden.
+   protection and code review, not disappeared. Branch protection is now on, so
+   that boundary is enforced rather than aspirational, but note what it means:
+   the strength of every signature in this project is now the strength of the
+   review on the pull request that produced it. Section 30.
 
 3. **A malicious dependency is signed too.** If a Go module in `go.sum` is
    compromised upstream, the pipeline builds it, signs it, and truthfully attests
@@ -1900,11 +1937,329 @@ rather than control.
 
 ---
 
-## 30. Known gaps in chapter 3
+## 30. Branch protection, and the automation that had to obey it
+
+This section is the second thing in chapter 3 that was learned rather than
+designed. It is here because the failure is instructive: **a security control
+was added, and the first thing it broke was the delivery pipeline.**
+
+### What happened
+
+The gap list at the end of this chapter opened with this entry:
+
+> **No branch protection on `main`.** The single largest gap, and the one that
+> most weakens the claim. The gate proves an image came from this pipeline; the
+> pipeline builds whatever is on `main`. Requiring review before merge is what
+> makes "from this repository" mean something.
+
+So it was turned on: a pull request required, and the **Secret and vulnerability
+gate** check required.
+
+The next build succeeded through every step. Scans passed, the OIDC role
+assumption worked, the image was pushed, scanned, given an SBOM attestation,
+signed, and given SLSA provenance, and the workflow verified all three against
+its own identity. Then the deploy job tried to push the digest to `main` and was
+refused:
+
+```text
+remote: error: GH013: Repository rule violations found for refs/heads/main.
+remote: - Changes must be made through a pull request.
+```
+
+Three times, because the deploy job retried on any push failure and rebased
+between attempts. That retry loop was written for a concurrent merge, which is a
+real thing that a rebase does resolve. **A rule violation is not a race.** It
+does not become true on the third attempt and rebasing cannot make it true. All
+the loop achieved was to print the one useful line three times and then close
+with a message about rebasing, which pointed the reader away from the cause.
+
+That is fixed too, and the fix is a classifier rather than a counter: refusals
+fail immediately with an explanation, races are retried, and anything
+unrecognised fails immediately rather than being retried hopefully. **Three
+identical failures with an unhelpful message are worse than one clear one**,
+because the repetition reads like a transient problem and invites you to re-run.
+
+### The choice
+
+There were three ways forward, and only one of them is defensible.
+
+#### Rejected: exempt Actions from the ruleset
+
+GitHub rulesets take a bypass list, and adding the Actions app to it would have
+made the original pipeline work again with no code change at all. It is the
+fastest fix and it is the wrong one.
+
+**The rule exists to constrain exactly this actor.** The pipeline is not an
+incidental writer to `main`; it is *the* thing whose commits reach the cluster.
+Every other contributor's changes have to pass through review specifically
+because they might end up deployed. Exempting the one actor that deploys, from
+the one control that reviews what gets deployed, leaves a rule that constrains
+only the people who were already going to open a pull request.
+
+There are two secondary reasons, and the first is the one that would show up
+later:
+
+- **A bypass entry is invisible from the code.** Someone reading
+  `build-sign-attest.yml` would see an ordinary `git push origin HEAD:main` and
+  have no way to learn that it is privileged. The fact that makes the pipeline
+  special would live in a settings page, in a different system, with no history
+  in this repository. Chapter 1 made the same argument about
+  `make apply ENV=prod` being refused in the Makefile rather than left to
+  discipline: **put the constraint where the reader is.**
+- **It keeps the credential strong.** A token that can push to a protected
+  `main` is materially more powerful than one that can push a branch and open a
+  pull request. Section 17's whole argument is about downgrading credentials
+  rather than protecting them better.
+
+#### Rejected: point ArgoCD at an unprotected branch
+
+Protect `main`, have the pipeline push freely to a `deploy` branch, and change
+`targetRevision` in the ArgoCD Applications to track that instead.
+
+This is worse than the bypass, because it *looks* like it preserves the control.
+It does not. **Whatever branch ArgoCD tracks is production.** Protecting `main`
+while deploying from an unprotected branch protects the branch nobody deploys
+from. The review requirement would apply to a branch with no path to the
+cluster, and the branch with a direct path to the cluster would have no review
+requirement at all.
+
+It would also break something chapter 2 spent a section establishing: that the
+cluster's state is a pure function of a commit on the default branch, so `git
+log` on `main` is the deployment history. Splitting those apart means the
+question "what is running" stops being answerable from the obvious place.
+
+The general shape is worth naming, because it recurs: **a control moved off the
+path it was meant to guard is not a weakened control, it is a decoration.** It
+still reports green, which makes it worse than not having it.
+
+#### Chosen: make the automation follow the rule
+
+The deploy job now does what a human contributor does. It creates a branch,
+commits the digest rewrite to it, pushes the branch, and opens a pull request
+against `main`. It cannot merge that pull request, and it is not meant to be
+able to.
+
+Nothing about the rule was changed, and nothing was exempted from it. The
+automation is simply a contributor that happens not to be a person, held to the
+identical standard, and the standard is enforced by GitHub rather than by
+anything in this repository choosing to comply.
+
+Two properties fall out of that, and both are worth more than the convenience
+that was given up:
+
+- **The deploy pull request is a review surface.** It carries the image
+  reference, the digest, the source commit and a link to the build run that
+  produced and verified it. Approving it is a deliberate act with the evidence
+  attached, rather than a commit that appeared on `main` overnight.
+- **Chapter 2's rebuttal 4 is now much less of a concession.** That rebuttal
+  admitted the pipeline still needed Git write access, and consoled itself that
+  Git write is auditable and *constrainable* with branch protection. It is now
+  actually constrained rather than theoretically constrainable.
+
+### The part that does not work by default, and the five ways out
+
+Making the automation follow the rule immediately runs into a rule of GitHub's
+own:
+
+> events triggered by the `GITHUB_TOKEN`, with the exception of
+> `workflow_dispatch` and `repository_dispatch`, will not create a new workflow
+> run
+
+This exists to stop workflows recursing, and this very pipeline relied on it as a
+loop guard. It also means **a pull request opened with `GITHUB_TOKEN` never
+triggers the gate.** The required check sits at "Expected, waiting" and the pull
+request cannot be merged as it stands. The automation would be following the rule
+in form while being structurally unable to satisfy it. A change GitHub rolled out
+in mid 2026 tightened this further: workflows triggered by pull requests the
+Actions bot created are held for manual approval even where they do run.
+
+There are five ways out of that, and the interesting thing is that the right one
+depends entirely on **how often you deploy**. That is not usually how security
+decisions are framed, and it should be more often.
+
+#### 1. Close and reopen the pull request by hand. CHOSEN.
+
+Closing and reopening produces a `reopened` event attributed to a person rather
+than to the token. The gate runs, the check goes green, and the pull request
+becomes mergeable. It works because the `pull_request` trigger's default event
+types are `opened`, `synchronize` and `reopened`, and this workflow does not
+override them.
+
+**Cost: two clicks per deploy. Credentials stored: none.**
+
+The deploy job prints the instruction with the pull request URL every time, as a
+job summary and as a run annotation, so it is not something to remember. It is
+the normal path, documented as such, rather than a fallback that fires when
+something is missing.
+
+#### 2. Scope the ruleset so the gate is not required on `deploy/*`
+
+Rulesets can target specific branch patterns, so `main` could require the gate
+while deploy branches did not.
+
+**This is genuinely defensible, and more so than it first sounds.** The gate
+scans source: secrets across the whole Git history, and known vulnerabilities in
+dependencies. A deploy pull request contains **one line**, a digest, generated by
+a build in which that same gate already ran and passed over that same tree. Re-
+running it proves nothing new. Requiring it there is ceremony, and ceremony that
+costs two clicks every deploy.
+
+It is rejected for now on a maintenance argument rather than a security one: it
+means a second ruleset to keep correct, and rulesets live in a settings page
+rather than in this repository. A rule that exists only in a web UI is a rule
+nobody reviews, and the next person to widen its pattern by accident gets no
+diff, no pull request and no reviewer. The same argument section 30 already makes
+against the bypass list applies, in smaller print.
+
+**This is the first thing to change if the deploy volume rises.**
+
+#### 3. Have a human make the commit
+
+Delete the deploy job. Read the digest out of the build summary and edit
+`deployment.yaml` yourself.
+
+Rejected, but worth stating because it is the honest baseline the automation has
+to beat. It is not obviously worse than option 1: both need a human, and this one
+needs no pipeline code at all. What it loses is that the digest is transcribed by
+hand, and a digest is sixty-four characters that mean nothing to a person. **The
+one thing humans are reliably bad at is copying long hex strings correctly**, and
+the failure mode is a manifest referencing an image that does not exist or, far
+worse, one that does. The automation is not saving effort here; it is removing a
+transcription error from the one value in this project that must be exact.
+
+#### 4. A personal access token
+
+Same capability as an App, longer lifetime, tied to a person rather than to an
+installation, and it carries that person's access to everything else they can
+reach. If the account gains access to another repository next month, so does this
+pipeline, silently.
+
+Rejected outright. It is strictly worse than option 5 on every axis, and option 5
+was itself rejected.
+
+#### 5. A GitHub App
+
+An App's installation token triggers workflows normally, so the gate runs on the
+deploy pull request exactly as it would on a human's. The token is short lived,
+an hour, and scoped to one repository and two permissions. **This is what a
+company deploying many times a day should do**, and it is the answer the GitHub
+documentation points at.
+
+Rejected here, and the reason is arithmetic rather than principle. The App
+requires storing its private key as a repository secret, permanently. This
+project currently has **zero** stored credentials: no AWS access key, because
+identity is proved rather than presented; no signing key, because signing is
+keyless; no cluster credential, because the cluster pulls. Adding a permanent
+secret to save two clicks, at a volume of roughly one deploy every few days, is a
+bad trade. At fifty deploys a day it is an obviously good one.
+
+### Right at this volume, wrong at scale
+
+Stating that plainly, because it is the part worth defending out loud rather than
+the part worth hiding.
+
+**This choice is correct at one deploy every few days and incorrect at fifty a
+day.** Nothing about the security reasoning changes with volume. What changes is
+the denominator: a fixed, permanent credential risk divided by an increasing
+number of manual interventions it removes. At low volume the manual step is
+cheap and the credential is expensive. At high volume the manual step becomes the
+bottleneck, people start looking for ways around it, and a control people route
+around is worse than one that costs a secret.
+
+**The order I would move in as volume rises is option 2, then option 5.**
+
+Option 2 first, because it costs no credential at all and it is the change with
+the honest argument behind it: the gate scans source, and a generated one line
+digest bump is not source. It also has a natural ceiling, in that it only helps
+if deploy pull requests really are trivial, which stops being true the moment
+anything else is automated onto that branch.
+
+Option 5 second, when the deploy pull request stops being trivial or when the
+manual step is being skipped in practice. At that point the App key is a
+proportionate cost, and it should be introduced as a deliberate, documented
+addition to the credential inventory in section 27 rather than as a convenience.
+
+**What should not happen is drifting into option 5 quietly**, which is the normal
+way projects acquire their first stored secret: a thing was inconvenient once,
+somebody fixed it, and nobody wrote down that the inventory changed.
+
+### What this cost
+
+Two things, and both are worth stating rather than glossing.
+
+**Deployment is no longer continuous.** A signed image sits in a pull request
+until somebody merges it, which for a single operator project means it deploys
+when the operator is at a keyboard.
+
+**And merging it takes three interactions rather than one:** close the pull
+request, reopen it so the gate runs, then review and merge. The middle one is
+pure friction with no security value, and it exists only because GitHub declines
+to trigger checks on a pull request its own token opened.
+
+Both are the correct trade here, because the thing being gated is *what runs in
+the cluster*, and because the alternative to the middle one is a permanent stored
+credential. They would be the wrong trade for a system that needs to ship a fix
+at three in the morning. The answer there is not to remove the gate but to make
+satisfying it fast: option 2 above removes the reopen step entirely, and the
+review itself is already cheap because the diff is one generated line with the
+evidence attached in the pull request body, approvable from a phone.
+
+### One consequence that is easy to miss
+
+The loop guard changed shape and got weaker, and the workflow file used to claim
+otherwise.
+
+`build-sign-attest.yml` skips builds for pushes that only touch
+`platform/manifests/**`, because otherwise recording a digest triggers a build
+that produces a new digest. The `BUILD_TIME` build argument means every rebuild
+produces different bytes and therefore a different digest, so that loop does not
+converge on its own.
+
+That filter used to be described as the second of two independent guards, the
+first being that `GITHUB_TOKEN` pushes do not trigger workflows. **The first
+guard is gone**, because the digest now reaches `main` through a merge performed
+by a human, and a human merge triggers workflows exactly as it should.
+
+The path filter still holds: for a push to an existing branch GitHub takes a
+two-dot diff between the old and new tip, so merging a deploy pull request
+presents exactly one changed file. That is true for merge, squash and rebase
+merges alike, because the deploy branch always carries exactly one commit
+touching exactly one path. It fails open in two documented cases, a push of more
+than 1,000 commits and a diff that times out, neither of which this pipeline can
+produce.
+
+The practical backstop is now that **every iteration of a runaway loop would need
+a human to merge a pull request.** So it cannot run away unattended. That is a
+sound backstop and it is also a conditional one: **if auto-merge is ever enabled
+on deploy pull requests, it disappears and a second explicit guard is needed.**
+That condition is written in the workflow file next to the filter, because it is
+the sort of thing that gets enabled by someone who has not read this section.
+
+A related trap, from the same corner of GitHub's behaviour: a workflow skipped by
+path filtering leaves its checks *Pending*, and a pull request requiring those
+checks is then blocked forever. That does not bite here only because the
+`pull_request` trigger deliberately carries no path filter. Adding one, as a
+tidying-up exercise, would deadlock every deploy pull request.
+
+---
+
+## 31. Known gaps in chapter 3
 
 Written down deliberately, because an unlisted gap looks like an oversight and a
 listed one looks like a roadmap.
 
+- **CLOSED: no branch protection on `main`.** This was the largest gap in the
+  list. It is now on, requiring a pull request and the secret and vulnerability
+  gate. Closing it broke the delivery pipeline, and the fix was to make the
+  automation obey the rule rather than be exempted from it. Section 30.
+- **Every deploy needs a manual close and reopen.** GitHub will not trigger the
+  required check on a pull request opened by `GITHUB_TOKEN`, so a person has to
+  reopen it. This is a deliberate choice over storing a GitHub App private key,
+  and it is a gap in the sense that it is friction with no security value: it is
+  right at this deploy volume and wrong at scale. Section 30 records all five
+  options and the order to move through them as volume rises.
+- **Deployment is no longer continuous.** A signed image waits in a pull request
+  for a human. Correct for what is being gated, and a real cost. Section 30.
 - **Renaming this repository breaks deployments until Terraform is updated.**
   The immutable IDs in the OIDC subject claim survive a rename, but the names
   sitting beside them do not, so the claim changes and `StringEquals` stops
@@ -1914,11 +2269,6 @@ listed one looks like a roadmap.
   `terraform.tfvars` and the diagnosis is in section 29. Accepted rather than
   solved: the alternative, conditioning on `repository_id` instead of `sub`,
   would drop the branch restriction unless it were rebuilt separately.
-- **No branch protection on `main`.** The single largest gap, and the one that
-  most weakens the claim. The gate proves an image came from this pipeline; the
-  pipeline builds whatever is on `main`. Requiring review before merge is what
-  makes "from this repository" mean something. It costs nothing and is the first
-  thing to fix.
 - **The policies cover one namespace.** Section 28, limit 12. The real pattern is
   to enforce cluster wide and carve out the few namespaces that genuinely cannot
   comply.
