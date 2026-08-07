@@ -93,10 +93,15 @@ spec:
               - ecr-pull
 
           attestations:
-            # The predicate type identifies the SCHEMA of the signed statement.
-            # SLSA v1 is what actions/attest-build-provenance produces.
+            # `type` identifies the SCHEMA of the signed statement. SLSA v1 is
+            # what actions/attest-build-provenance produces.
+            #
+            # The older spelling of this field was `predicateType`, and setting
+            # both makes the API server emit a deprecation warning on every
+            # apply. Warnings that appear on every apply are warnings nobody
+            # reads, which matters more than usual in a file whose failure to
+            # apply is the subject of section 31.
             - type: https://slsa.dev/provenance/v1
-              predicateType: https://slsa.dev/provenance/v1
 
               attestors:
                 - count: 1
@@ -173,4 +178,21 @@ spec:
                       operator: Equals
                       value: ".github/workflows/build-sign-attest.yml"
 
-      failureAction: Enforce
+          # DENY, NOT AUDIT.
+          #
+          # NOTE THE NESTING. This belongs to the verifyImages ENTRY, not to the
+          # rule. Written one level out, at `spec.rules[].failureAction`, the API
+          # server rejects the whole policy with
+          #
+          #   .spec.rules[0].failureAction: field not declared in schema
+          #
+          # and ArgoCD reports the application Missing while the workload it was
+          # supposed to gate starts perfectly happily. That is exactly what
+          # happened, and docs/architecture.md section 31 is about why that
+          # failure mode is worse than a policy that merely refuses everything.
+          #
+          # `failureAction` has lived here since Kyverno v1.13 at least; it has
+          # never existed at rule level in any published chart. It replaced the
+          # deprecated `spec.validationFailureAction`, which still exists and
+          # still works, and which is NOT what this uses.
+          failureAction: Enforce

@@ -2243,11 +2243,213 @@ tidying-up exercise, would deadlock every deploy pull request.
 
 ---
 
-## 31. Known gaps in chapter 3
+## 31. The gate that was not installed
+
+The third thing in chapter 3 learned rather than designed, and the most alarming
+of the three.
+
+### What happened
+
+Both `ClusterPolicy` objects were rejected by the API server:
+
+```text
+.spec.rules[0].failureAction: field not declared in schema
+```
+
+ArgoCD retried five times, gave up, and reported the `kyverno-policies`
+application as **Missing**. `kubectl get clusterpolicy` returned nothing.
+
+And the demo application deployed perfectly. Two pods, `1/1`, `Running`, serving
+traffic, with **no admission control in front of them at all.**
+
+### Why this is worse than the gate rejecting everything
+
+If the policies had been too strict, the failure would have been immediate and
+loud: pods refused, `kubectl` printing the reason, a broken deployment somebody
+has to fix before the day continues.
+
+Instead the gate was absent, and **an absent gate and a passing gate produce
+identical observations from every direction except one.**
+
+| What you look at | Gate absent | Gate passing |
+|---|---|---|
+| `kubectl get pods -n demo` | 2/2 Running | 2/2 Running |
+| The demo app in a browser | serves | serves |
+| `make argocd-status` (before this) | demo-app Synced, Healthy | demo-app Synced, Healthy |
+| Cluster events | nothing | nothing |
+| `kubectl get clusterpolicy` | **No resources found** | two policies, Ready |
+
+Only the last row differs, and it is the row nobody looks at, because the reason
+you installed a gate is so that you would not have to keep checking.
+
+There is a general principle worth taking from this, and it is not specific to
+Kyverno:
+
+> **A security control that is absent fails silently. A security control that is
+> wrong fails loudly. The absent one is more dangerous, and it is the one your
+> monitoring is least likely to notice, because monitoring watches for things
+> going wrong rather than for things not happening.**
+
+Section 22 and the Kyverno Application both already made a version of this
+argument about sync waves, in the abstract, and predicted almost exactly this
+outcome: *"the pods would be running and every Application would report Synced
+and Healthy. The gate would simply not have been consulted, which is the worst
+failure mode a security control has."* It was written down as a hazard and then
+arrived through a completely different door.
+
+### The cause, and the hypothesis that was wrong
+
+The obvious reading was a version mismatch: the policies were validated against
+Kyverno v1.18.2's schema, the chart pinned was 3.8.2, and chart versions and
+application versions are different numbers, so presumably 3.8.2 shipped something
+older that lacked the field.
+
+**That was wrong, and testing it was still the right thing to do.** The check:
+
+```bash
+helm show chart kyverno/kyverno --version 3.8.2 | grep appVersion
+#   appVersion: v1.18.2
+
+kubectl get deploy -n kyverno \
+  -o jsonpath='{.items[*].spec.template.spec.containers[0].image}'
+#   reg.kyverno.io/kyverno/kyverno:v1.18.2
+```
+
+Chart 3.8.2 does install v1.18.2. The numbers lined up. So the field had to exist
+somewhere, and the real question was **where**.
+
+Rendering the CRD the chart actually ships, across seven chart versions spanning
+Kyverno v1.13 to v1.19, gave the answer:
+
+| | `spec.rules[].failureAction` | `spec.rules[].verifyImages[].failureAction` |
+|---|---|---|
+| chart 3.3.7 (v1.13.4) | absent | present |
+| chart 3.6.4 (v1.16.4) | absent | present |
+| chart 3.8.2 (v1.18.2) | absent | present |
+| chart 3.9.0-rc.1 (v1.19.0-rc.1) | absent | present |
+
+**`failureAction` has never existed at rule level, in any published version.** It
+belongs to the `verifyImages` entry. The policies had it one nesting level too
+high, and no chart version would have fixed that.
+
+This is worth recording precisely because the wrong hypothesis was so plausible.
+"Pin a different version" would have burned an afternoon, changed a working pin
+for no reason, and left the actual defect in place. The thing that resolved it
+was not cleverness, it was **rendering the artefact instead of reasoning about
+its version number.**
+
+### Why the validation did not catch it
+
+The policies *were* validated before being committed, against the CRD from
+Kyverno's v1.18.2 source tag, and the validation passed with zero errors.
+
+The validator was the problem. It set `additionalProperties: false` at the top
+level of the schema only, not recursively. JSON Schema permits unknown properties
+by default, so every nested object still accepted anything at all. A field at the
+wrong depth is *precisely* the mistake that validator could not see.
+
+Running both validators against the broken policy:
+
+```text
+WEAK   (additionalProperties only at the root)  accepts the broken policy
+STRICT (additionalProperties at every depth)    REJECTS: 'failureAction' was unexpected
+```
+
+**A validation that cannot fail is not a validation, and it is the same shape of
+failure as the missing gate itself: a check that reports success without
+checking.** Two instances of the identical mistake, one in the policy tooling and
+one in the cluster, discovered in the same hour.
+
+There is a second lesson underneath that. The validator was pointed at a CRD
+downloaded from an upstream *release tag*. The schema that actually judges your
+policy is the CRD the *chart* installed, and chart CRDs are generated per chart
+release. A release tag is a good guess. The cluster is the fact.
+
+### What changed
+
+**The policies**, obviously: `failureAction` moved inside the `verifyImages`
+entry, with a comment at the point of the mistake explaining what the wrong
+nesting produces, so the next person to move it gets the story rather than a
+puzzle.
+
+**`make lint-policies`**, which runs `kubectl apply --dry-run=server` over
+`policies/`. The API server decodes strictly, at every depth, using the CRD the
+running Kyverno actually installed. It rejects the old nesting with
+`strict decoding error: unknown field "spec.rules[0].failureAction"` and accepts
+the new one. That is the authoritative check, it takes under a second, and it is
+wired into `make lint`, skipping with a message when no cluster is available
+rather than failing on a fresh machine.
+
+**`make check-policies`**, which asserts the gate is actually there:
+
+- the `ClusterPolicy` CRD exists, so Kyverno is installed at all;
+- the number of policies in the cluster matches the number of files in
+  `policies/`, because a partially applied gate is not a gate;
+- every one of them reports `Ready`, because a policy that is present but not
+  Ready is not enforcing.
+
+It fails with an explanation rather than a status code, and it names the command
+that shows why:
+
+```text
+FAIL: NO ADMISSION POLICIES ARE INSTALLED.
+
+policies/ holds 2 policies and the cluster has none.
+Every workload in the demo namespace is running unverified.
+
+This is worse than the gate rejecting everything, because it
+looks exactly like the gate passing everything.
+```
+
+**`make argocd-up` now waits for the policies and then refuses to report
+success** if they never arrive. It previously printed a cheerful summary and a
+list of next steps in exactly the situation described here. A bootstrap command
+that says "ready" when the security control is absent is teaching you to trust
+the wrong thing.
+
+`make kyverno-status` and `make supply-chain-status` both run the same assertion,
+so the question "is the gate on" is answered by every status command rather than
+by remembering to ask.
+
+### The general lesson: a chart version is not an application version
+
+This was not the cause here, and it remains worth writing down, because it was
+the *right* first hypothesis and it will be the right one eventually.
+
+`kyverno` chart `3.8.2` installs Kyverno `v1.18.2`. Neither number can be derived
+from the other. They are maintained by the same project, in the same repository,
+and they still move independently: a chart release that only changes a template
+bumps the chart version and not the application version.
+
+Three consequences, in increasing order of how much trouble they cause:
+
+1. **Pinning a chart version does not pin an application version**, unless the
+   chart is one that pins its own image tags, which most do.
+2. **The CRDs are shipped by the chart**, not by the application. They are
+   generated at chart release time, which is why the schema your policies are
+   judged against is a property of the chart version and not of the image tag.
+3. **The upstream source tree is not the artefact.** Reading
+   `config/crds/...` from a release tag on GitHub tells you what the project
+   intended. Rendering the chart tells you what you are about to install. Only
+   the second one is what your cluster will enforce.
+
+The Application pins `3.8.2` with a trailing comment naming `v1.18.2`, and the
+comment explicitly says the two are different numbers, because a bare
+`# v1.18.2` next to `3.8.2` invites exactly the confusion that started this
+section.
+
+---
+
+## 32. Known gaps in chapter 3
 
 Written down deliberately, because an unlisted gap looks like an oversight and a
 listed one looks like a roadmap.
 
+- **CLOSED: the admission gate was silently absent.** Both policies failed to
+  apply for a schema error and the demo workload ran with nothing in front of it.
+  Fixed, and now guarded three ways: `make lint-policies` validates against the
+  live API before commit, `make check-policies` asserts the gate is present and
+  Ready, and `make argocd-up` refuses to report success without it. Section 31.
 - **CLOSED: no branch protection on `main`.** This was the largest gap in the
   list. It is now on, requiring a pull request and the secret and vulnerability
   gate. Closing it broke the delivery pipeline, and the fix was to make the

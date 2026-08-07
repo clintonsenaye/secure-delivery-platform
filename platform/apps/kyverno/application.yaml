@@ -68,9 +68,25 @@ spec:
     #
     # Check for newer releases with:
     #   helm search repo kyverno/kyverno --versions
+    #
+    # THE TRAILING COMMENT IS A DIFFERENT NUMBER FROM THE PIN, and that is the
+    # point of writing it down. 3.8.2 is the CHART version; v1.18.2 is the
+    # APPLICATION version it installs. They are maintained by the same project
+    # and they still move independently, so neither can be inferred from the
+    # other.
+    #
+    # The mapping was verified rather than assumed, and it holds:
+    #
+    #   helm show chart kyverno/kyverno --version 3.8.2 | grep appVersion
+    #   kubectl get deploy -n kyverno -o jsonpath='{.items[*].spec.template.spec.containers[0].image}'
+    #
+    # Worth doing, because the CRDs a chart ships are generated per chart release
+    # and are the schema your policies are actually validated against. A schema
+    # read from an upstream release tag is a good guess and not the artefact.
+    # See docs/architecture.md section 31.
     repoURL: https://kyverno.github.io/kyverno/
     chart: kyverno
-    targetRevision: 3.8.2  # Kyverno v1.18.2
+    targetRevision: 3.8.2  # chart 3.8.2 installs Kyverno v1.18.2 (verified)
 
     helm:
       releaseName: kyverno

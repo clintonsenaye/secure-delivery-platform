@@ -505,7 +505,7 @@ branch, which protects the branch nobody deploys from. That is written up in ful
 in [section 30](docs/architecture.md).
 
 **The gaps chapter 3 leaves** are listed in
-[section 31](docs/architecture.md).
+[section 32](docs/architecture.md).
 
 ### Three limits worth knowing before you read the code
 
